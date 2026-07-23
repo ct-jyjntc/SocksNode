@@ -1,0 +1,9 @@
+node_modules
+dist
+.DS_Store
+*.log
+.vite
+release
+src-tauri/target
+SocksNode-*.dmg
+*.app

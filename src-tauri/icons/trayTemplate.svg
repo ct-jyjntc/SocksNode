@@ -1,0 +1,24 @@
+<svg width="18" height="18" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Menu bar template (black glyph). Derived from app mark; macOS tints for light/dark. -->
+  <!-- Network Line -->
+  <line
+    x1="260" y1="720" x2="720" y2="310"
+    fill="none"
+    stroke="black"
+    stroke-width="48"
+    stroke-linecap="round"
+  />
+  <!-- S -->
+  <path
+    d="M670 280 H430 C350 280 300 330 300 400 C300 470 350 520 430 520 H590 C670 520 720 570 720 640 C720 710 670 760 590 760 H350"
+    fill="none"
+    stroke="black"
+    stroke-width="96"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <!-- Nodes (filled for legibility at 18px) -->
+  <circle cx="260" cy="720" r="52" fill="black"/>
+  <circle cx="512" cy="512" r="52" fill="black"/>
+  <circle cx="720" cy="310" r="52" fill="black"/>
+</svg>

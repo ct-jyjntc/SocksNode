@@ -1,0 +1,28 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect x="40" y="40" width="944" height="944" rx="180" fill="#FFFFFF"/>
+
+  <!-- Network Line -->
+  <line
+    x1="260" y1="720" x2="720" y2="310"
+    fill="none"
+    stroke="#18C37E"
+    stroke-width="24"
+    stroke-linecap="round"
+  />
+
+  <!-- S -->
+  <path
+    d="M670 280 H430 C350 280 300 330 300 400 C300 470 350 520 430 520 H590 C670 520 720 570 720 640 C720 710 670 760 590 760 H350"
+    fill="none"
+    stroke="#132235"
+    stroke-width="96"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Nodes -->
+  <circle cx="260" cy="720" r="42" fill="white" stroke="#18C37E" stroke-width="24"/>
+  <circle cx="512" cy="512" r="42" fill="white" stroke="#18C37E" stroke-width="24"/>
+  <circle cx="720" cy="310" r="42" fill="white" stroke="#18C37E" stroke-width="24"/>
+</svg>

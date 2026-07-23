@@ -1,0 +1,69 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SocksNode",
+  "version": "1.0.0",
+  "identifier": "com.socksnode.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev:web",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run build:web",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "SocksNode",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 16.0,
+          "y": 18.0
+        },
+        "label": "main"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "dmg",
+      "app"
+    ],
+    "category": "Utility",
+    "shortDescription": "Local SOCKS bridge via mihomo",
+    "longDescription": "Convert upstream proxy nodes into local SOCKS5 endpoints. One mihomo process per node, no system proxy or TUN.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns"
+    ],
+    "resources": [
+      "resources/mihomo",
+      "icons/tray.png",
+      "icons/tray@2x.png"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": null,
+      "entitlements": null,
+      "exceptionDomain": null
+    },
+    "externalBin": []
+  },
+  "plugins": {}
+}
