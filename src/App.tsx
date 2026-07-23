@@ -287,11 +287,11 @@ export default function App() {
           <div>
             <div className="mb-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
               <Cable className="size-3.5" strokeWidth={1.7} />
-              SocksNode · mihomo local bridge
+              SocksNode · anytls local bridge
             </div>
             <h1 className="text-2xl font-medium tracking-tight">节点转发</h1>
             <p className="mt-1 max-w-xl text-xs leading-5 text-muted-foreground">
-              每个节点独立启动一个 mihomo 实例，仅暴露本地 SOCKS。不启用系统代理与虚拟网卡。
+              每个节点独立启动一个 anytls-client 实例，仅暴露本地 SOCKS。不启用系统代理与虚拟网卡。
             </p>
           </div>
 
@@ -549,7 +549,7 @@ export default function App() {
                 <h2 className="mb-3 text-sm font-medium">运行环境</h2>
                 <dl className="space-y-2 text-xs">
                   <Row label="版本" value={info.version} />
-                  <Row label="mihomo" value={info.mihomoPath} mono />
+                  <Row label="内核" value={info.mihomoPath} mono />
                   <Row label="数据" value={info.dataDir} mono />
                 </dl>
               </Card>

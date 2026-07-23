@@ -2,8 +2,8 @@
 
 把上游代理节点（如 anytls）转发为本地 SOCKS5 的轻量桌面工具。
 
-- 内置 `mihomo` 内核
-- 每个节点独立进程、独立配置
+- 内置 `anytls-client` 内核（约 6MB，替代原 41MB mihomo）
+- 每个节点独立进程
 - 仅本地 SOCKS，不启用系统代理 / TUN
 - Quiet Console 风格界面
 - **Tauri 2** 壳（系统 WebView 壳）

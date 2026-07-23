@@ -3,7 +3,7 @@
   "productName": "SocksNode",
   "version": "1.0.0",
   "private": true,
-  "description": "Convert proxy nodes into local SOCKS endpoints via mihomo",
+  "description": "Convert proxy nodes into local SOCKS endpoints via anytls-client",
   "author": "SocksNode",
   "type": "module",
   "scripts": {

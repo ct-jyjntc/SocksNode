@@ -1,7 +1,7 @@
 [package]
 name = "socks-node"
 version = "1.0.0"
-description = "Convert proxy nodes into local SOCKS endpoints via mihomo"
+description = "Convert proxy nodes into local SOCKS endpoints via anytls-client"
 authors = ["SocksNode"]
 edition = "2021"
 
@@ -18,7 +18,6 @@ tauri-plugin-shell = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"

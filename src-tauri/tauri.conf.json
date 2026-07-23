@@ -43,8 +43,8 @@
       "app"
     ],
     "category": "Utility",
-    "shortDescription": "Local SOCKS bridge via mihomo",
-    "longDescription": "Convert upstream proxy nodes into local SOCKS5 endpoints. One mihomo process per node, no system proxy or TUN.",
+    "shortDescription": "Local SOCKS bridge via anytls-client",
+    "longDescription": "Convert upstream proxy nodes into local SOCKS5 endpoints. One anytls-client process per node, no system proxy or TUN.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -53,7 +53,7 @@
       "icons/icon.icns"
     ],
     "resources": [
-      "resources/mihomo",
+      "resources/anytls-client",
       "icons/tray.png",
       "icons/tray@2x.png"
     ],

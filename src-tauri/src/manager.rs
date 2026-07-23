@@ -3,7 +3,6 @@ use crate::models::{
     NodeStatus, NodeTestResult, ProxyNode,
 };
 use parking_lot::Mutex;
-use serde_json::json;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -119,22 +118,22 @@ impl Manager {
     pub fn get_info(&self, version: &str) -> AppInfo {
         AppInfo {
             data_dir: self.data_dir.display().to_string(),
-            mihomo_path: self.mihomo_path().display().to_string(),
+            mihomo_path: self.kernel_path().display().to_string(),
             version: version.to_string(),
         }
     }
 
-    pub fn mihomo_path(&self) -> PathBuf {
+    pub fn kernel_path(&self) -> PathBuf {
         let candidates = [
-            self.resources_dir.join("mihomo"),
-            self.resources_dir.join("resources").join("mihomo"),
+            self.resources_dir.join("anytls-client"),
+            self.resources_dir.join("resources").join("anytls-client"),
         ];
         for p in candidates {
             if p.exists() {
                 return p;
             }
         }
-        self.resources_dir.join("mihomo")
+        self.resources_dir.join("anytls-client")
     }
 
     fn append_log(&self, id: &str, line: impl AsRef<str>) {
@@ -166,54 +165,6 @@ impl Manager {
         let dir = self.instances_dir.join(id);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         Ok(dir)
-    }
-
-    fn build_config_yaml(node: &ProxyNode) -> Result<String, String> {
-        let mut proxy = serde_json::Map::new();
-        proxy.insert("name".into(), json!("node"));
-        proxy.insert("type".into(), json!(node.proxy_type));
-        proxy.insert("server".into(), json!(node.server));
-        proxy.insert("port".into(), json!(node.port));
-        proxy.insert("password".into(), json!(node.password));
-        proxy.insert("udp".into(), json!(node.udp));
-        if !node.sni.is_empty() {
-            proxy.insert("sni".into(), json!(node.sni));
-        }
-        proxy.insert("skip-cert-verify".into(), json!(node.skip_cert_verify));
-
-        let config = json!({
-            "mixed-port": 0,
-            "port": 0,
-            "socks-port": node.local_port,
-            "allow-lan": false,
-            "bind-address": "127.0.0.1",
-            "mode": "rule",
-            "log-level": "info",
-            "ipv6": true,
-            "find-process-mode": "off",
-            "external-controller": "",
-            "unified-delay": true,
-            "dns": {
-                "enable": true,
-                "ipv6": true,
-                "enhanced-mode": "redir-host",
-                "default-nameserver": ["8.8.8.8", "1.1.1.1"],
-                "nameserver": ["8.8.8.8", "1.1.1.1", "https://dns.google/dns-query"]
-            },
-            "proxies": [proxy],
-            "proxy-groups": [],
-            "rules": ["MATCH,node"]
-        });
-
-        serde_yaml::to_string(&config).map_err(|e| e.to_string())
-    }
-
-    fn write_config(&self, node: &ProxyNode) -> Result<(PathBuf, PathBuf), String> {
-        let dir = self.instance_dir(&node.id)?;
-        let config_path = dir.join("config.yaml");
-        let yaml = Self::build_config_yaml(node)?;
-        std::fs::write(&config_path, yaml).map_err(|e| e.to_string())?;
-        Ok((dir, config_path))
     }
 
     fn normalize_input(
@@ -389,9 +340,9 @@ impl Manager {
             }
         }
 
-        let mihomo = self.mihomo_path();
-        if !mihomo.exists() {
-            return Err(format!("找不到 mihomo 内核: {}", mihomo.display()));
+        let kernel = self.kernel_path();
+        if !kernel.exists() {
+            return Err(format!("找不到 anytls 内核: {}", kernel.display()));
         }
 
         let (local_port, name_for_log) = {
@@ -419,29 +370,38 @@ impl Manager {
                 .ok_or("节点不存在")?
         };
 
-        let (dir, config_path) = self.write_config(&node_snapshot)?;
+        let dir = self.instance_dir(&node_snapshot.id)?;
+        let listen = format!("127.0.0.1:{}", node_snapshot.local_port);
+        let server = format!("{}:{}", node_snapshot.server, node_snapshot.port);
+        let sni = if node_snapshot.sni.is_empty() {
+            "www.icloud.com".to_string()
+        } else {
+            node_snapshot.sni.clone()
+        };
+
         self.append_log(
             id,
-            format!(
-                "starting mihomo on socks 127.0.0.1:{}",
-                node_snapshot.local_port
-            ),
+            format!("starting anytls-client on socks {listen}"),
         );
-        self.append_log(id, format!("config: {}", config_path.display()));
+        self.append_log(id, format!("upstream: {server} sni={sni}"));
 
-        let mut child = Command::new(&mihomo)
+        let mut child = Command::new(&kernel)
             .args([
-                "-d",
-                dir.to_str().unwrap_or("."),
-                "-f",
-                config_path.to_str().unwrap_or(""),
+                "-l",
+                &listen,
+                "-s",
+                &server,
+                "-p",
+                &node_snapshot.password,
+                "-sni",
+                &sni,
             ])
             .current_dir(&dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("启动 mihomo 失败: {e}"))?;
+            .map_err(|e| format!("启动 anytls-client 失败: {e}"))?;
 
         let pid = child.id();
         {
@@ -486,7 +446,7 @@ impl Manager {
                     Ok(None) => true,
                     Ok(Some(status)) => {
                         procs.remove(id);
-                        let msg = format!("mihomo 启动后立即退出 ({status})");
+                        let msg = format!("anytls-client 启动后立即退出 ({status})");
                         {
                             let mut nodes = self.nodes.lock();
                             if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
@@ -577,7 +537,7 @@ impl Manager {
                                 node.status,
                                 NodeStatus::Running | NodeStatus::Starting
                             ) {
-                                let msg = format!("mihomo 退出 ({status})");
+                                let msg = format!("anytls-client 退出 ({status})");
                                 node.status = NodeStatus::Error;
                                 node.pid = None;
                                 node.last_error = Some(msg.clone());
@@ -838,11 +798,15 @@ pub fn resolve_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
         .unwrap_or_else(|_| PathBuf::from("src-tauri/resources"));
 
     let dev_resources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-    let resources_dir = if dev_resources.join("mihomo").exists() {
+    let resources_dir = if dev_resources.join("anytls-client").exists() {
         dev_resources
-    } else if resources_dir.join("mihomo").exists() {
+    } else if resources_dir.join("anytls-client").exists() {
         resources_dir
-    } else if resources_dir.join("resources").join("mihomo").exists() {
+    } else if resources_dir
+        .join("resources")
+        .join("anytls-client")
+        .exists()
+    {
         resources_dir.join("resources")
     } else {
         resources_dir
