@@ -1,0 +1,60 @@
+diff --git a/cmd/client/inbound.go b/cmd/client/inbound.go
+index 8e889b3..561eb07 100644
+--- a/cmd/client/inbound.go
++++ b/cmd/client/inbound.go
+@@ -6,6 +6,7 @@ import (
+ 	"net"
+ 	"runtime/debug"
+ 
++	"github.com/sagernet/sing/common/buf"
+ 	"github.com/sagernet/sing/common/bufio"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	"github.com/sagernet/sing/common/network"
+@@ -58,17 +59,37 @@ func (c *myClient) NewConnection(ctx context.Context, conn net.Conn, metadata M.
+ }
+ 
+ func (c *myClient) NewPacketConnection(ctx context.Context, conn network.PacketConn, metadata M.Metadata) error {
++	// SOCKS5 UDP ASSOCIATE often reports destination as 0.0.0.0:0.
++	// Many server implementations (sing-box/mihomo) use the UoT request
++	// destination for routing/ACL at handshake time. Advertising 0.0.0.0:0
++	// gets routed to block. Wait for the first real packet and use that
++	// destination — same behavior as mihomo's anytls outbound.
++	firstBuffer := buf.NewPacket()
++	firstDestination, err := conn.ReadPacket(firstBuffer)
++	if err != nil {
++		firstBuffer.Release()
++		return err
++	}
++
+ 	proxyC, err := c.CreateProxy(ctx, uot.RequestDestination(2))
+ 	if err != nil {
++		firstBuffer.Release()
+ 		logrus.Errorln("CreateProxy:", err)
+ 		return err
+ 	}
+ 	defer proxyC.Close()
+ 
++	requestDestination := firstDestination
++	if !requestDestination.IsValid() {
++		// Fallback: keep previous behavior if packet destination is unusable.
++		requestDestination = metadata.Destination
++	}
+ 	request := uot.Request{
+-		Destination: metadata.Destination,
++		Destination: requestDestination,
+ 	}
+ 	uotC := uot.NewLazyConn(proxyC, request)
+ 
++	// Replay the first packet into the copy loop.
++	conn = bufio.NewCachedPacketConn(conn, firstBuffer, firstDestination)
+ 	return bufio.CopyPacketConn(ctx, conn, uotC)
+ }
+diff --git a/util/version.go b/util/version.go
+index b1bdd81..e2b2718 100644
+--- a/util/version.go
++++ b/util/version.go
+@@ -1,3 +1,3 @@
+ package util
+ 
+-var ProgramVersionName = "anytls/0.0.13"
++var ProgramVersionName = "anytls/0.0.13-socksnode1"
