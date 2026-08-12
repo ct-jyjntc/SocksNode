@@ -33,6 +33,16 @@ pub struct NodeTestResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProbeStatus {
+    pub ok: bool,
+    pub ms: Option<u64>,
+    pub ip: Option<String>,
+    pub message: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProxyNode {
     pub id: String,
     pub name: String,
@@ -46,12 +56,27 @@ pub struct ProxyNode {
     pub skip_cert_verify: bool,
     pub local_port: u16,
     pub enabled: bool,
+    /// Prefer multi-source DNS + local tcping for domain hosts.
+    #[serde(default = "default_true")]
+    pub prefer_fastest_ip: bool,
+    /// Bind SOCKS on 0.0.0.0 so LAN devices can connect.
+    #[serde(default)]
+    pub lan_access: bool,
+    /// Currently selected upstream IP (runtime; may differ from `server` domain).
+    #[serde(default)]
+    pub active_ip: Option<String>,
+    #[serde(default)]
+    pub last_probe: Option<ProbeStatus>,
     pub status: NodeStatus,
     pub pid: Option<u32>,
     pub last_error: Option<String>,
     pub last_test: Option<NodeTestResult>,
     pub updated_at: Option<String>,
+    /// Local-only SOCKS URL (127.0.0.1).
     pub socks: String,
+    /// LAN-reachable SOCKS URL when `lan_access` is on (best-effort primary IPv4).
+    #[serde(default)]
+    pub lan_socks: Option<String>,
     pub running: bool,
 }
 
@@ -73,6 +98,10 @@ pub struct NodeInput {
     pub local_port: u16,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub prefer_fastest_ip: bool,
+    #[serde(default)]
+    pub lan_access: bool,
 }
 
 fn default_type() -> String {
@@ -123,6 +152,17 @@ pub(crate) struct StoredNode {
     #[serde(rename = "localPort", alias = "local_port")]
     local_port: u16,
     enabled: bool,
+    #[serde(
+        rename = "preferFastestIp",
+        alias = "prefer_fastest_ip",
+        default = "default_true"
+    )]
+    prefer_fastest_ip: bool,
+    #[serde(rename = "lanAccess", alias = "lan_access", default)]
+    lan_access: bool,
+    /// Sticky preferred upstream IP after a successful select (skip re-test while alive).
+    #[serde(rename = "activeIp", alias = "active_ip", default)]
+    active_ip: Option<String>,
     #[serde(rename = "updatedAt", alias = "updated_at", default)]
     updated_at: Option<String>,
 }
@@ -149,13 +189,15 @@ impl ProxyNode {
             skip_cert_verify: self.skip_cert_verify,
             local_port: self.local_port,
             enabled: self.enabled,
+            prefer_fastest_ip: self.prefer_fastest_ip,
+            lan_access: self.lan_access,
+            active_ip: self.active_ip.clone(),
             updated_at: self.updated_at.clone(),
         }
     }
 
     pub fn from_stored(s: StoredNode) -> Self {
-        let socks = format!("socks5://127.0.0.1:{}", s.local_port);
-        Self {
+        let mut node = Self {
             id: s.id,
             name: s.name,
             proxy_type: s.proxy_type,
@@ -167,19 +209,51 @@ impl ProxyNode {
             skip_cert_verify: s.skip_cert_verify,
             local_port: s.local_port,
             enabled: s.enabled,
+            prefer_fastest_ip: s.prefer_fastest_ip,
+            lan_access: s.lan_access,
+            active_ip: s.active_ip,
+            last_probe: None,
             status: NodeStatus::Stopped,
             pid: None,
             last_error: None,
             last_test: None,
             updated_at: s.updated_at,
-            socks,
+            socks: String::new(),
+            lan_socks: None,
             running: false,
-        }
+        };
+        node.refresh_public_fields();
+        node
     }
 
     pub fn refresh_public_fields(&mut self) {
         self.socks = format!("socks5://127.0.0.1:{}", self.local_port);
+        self.lan_socks = if self.lan_access {
+            primary_lan_ipv4().map(|ip| format!("socks5://{ip}:{}", self.local_port))
+        } else {
+            None
+        };
         self.running = self.status == NodeStatus::Running;
+    }
+
+    pub fn listen_addr(&self) -> String {
+        if self.lan_access {
+            format!("0.0.0.0:{}", self.local_port)
+        } else {
+            format!("127.0.0.1:{}", self.local_port)
+        }
+    }
+}
+
+/// Best-effort primary LAN IPv4 (outbound interface).
+pub fn primary_lan_ipv4() -> Option<String> {
+    use std::net::{IpAddr, UdpSocket};
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // No packets need to be sent; connect selects the outbound interface.
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(v4.to_string()),
+        _ => None,
     }
 }
 
@@ -197,12 +271,17 @@ pub fn default_nodes() -> Vec<ProxyNode> {
             skip_cert_verify: true,
             local_port: 5001,
             enabled: true,
+            prefer_fastest_ip: true,
+            lan_access: false,
+            active_ip: None,
+            last_probe: None,
             status: NodeStatus::Stopped,
             pid: None,
             last_error: None,
             last_test: None,
             updated_at: Some(now_iso()),
             socks: "socks5://127.0.0.1:5001".into(),
+            lan_socks: None,
             running: false,
         },
         ProxyNode {
@@ -217,12 +296,17 @@ pub fn default_nodes() -> Vec<ProxyNode> {
             skip_cert_verify: true,
             local_port: 5002,
             enabled: true,
+            prefer_fastest_ip: true,
+            lan_access: false,
+            active_ip: None,
+            last_probe: None,
             status: NodeStatus::Stopped,
             pid: None,
             last_error: None,
             last_test: None,
             updated_at: Some(now_iso()),
             socks: "socks5://127.0.0.1:5002".into(),
+            lan_socks: None,
             running: false,
         },
     ]

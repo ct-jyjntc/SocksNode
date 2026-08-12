@@ -15,21 +15,21 @@
     "windows": [
       {
         "title": "SocksNode",
-        "width": 1180,
-        "height": 780,
-        "minWidth": 960,
-        "minHeight": 640,
+        "width": 1080,
+        "height": 720,
+        "minWidth": 880,
+        "minHeight": 560,
         "resizable": true,
         "fullscreen": false,
         "decorations": true,
         "transparent": false,
+        "label": "main",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "trafficLightPosition": {
-          "x": 16.0,
-          "y": 18.0
-        },
-        "label": "main"
+          "x": -100.0,
+          "y": -100.0
+        }
       }
     ],
     "security": {

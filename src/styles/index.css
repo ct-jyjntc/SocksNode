@@ -108,6 +108,7 @@
   body,
   #root {
     height: 100%;
+    overflow: hidden;
   }
 
   body {
@@ -115,16 +116,29 @@
     background: var(--background);
     color: var(--foreground);
     font-family: var(--font-sans);
-    font-size: 14px;
+    /* Quiet Console dense desktop: ~14.7px */
+    font-size: 14.7px;
     letter-spacing: 0;
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
+    user-select: none;
+    -webkit-app-region: no-drag;
+    overflow: hidden;
+  }
+
+  input,
+  textarea,
+  [data-selectable],
+  .allow-select {
+    user-select: text;
   }
 
   ::selection {
     background: color-mix(in oklab, var(--primary) 24%, transparent);
   }
 }
+
+
 
 /* Window drag regions (Tauri Overlay titlebar) */
 .app-drag,
