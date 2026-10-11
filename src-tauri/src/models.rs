@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum NodeStatus {
     #[serde(rename = "stopped")]
+    #[default]
     Stopped,
     #[serde(rename = "starting")]
     Starting,
@@ -13,12 +14,6 @@ pub enum NodeStatus {
     Stopping,
     #[serde(rename = "error")]
     Error,
-}
-
-impl Default for NodeStatus {
-    fn default() -> Self {
-        Self::Stopped
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

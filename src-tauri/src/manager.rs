@@ -386,17 +386,7 @@ impl Manager {
 
     fn persist_nodes(&self, nodes: &[ProxyNode]) -> Result<(), String> {
         let json = store_to_json(nodes).map_err(|e| e.to_string())?;
-        std::fs::write(&self.store_path, json).map_err(|e| e.to_string())?;
-        // nodes.json holds upstream passwords; keep it private to the user.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.store_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
-        }
-        Ok(())
+        crate::secure_store::write_private(&self.store_path, json.as_bytes())
     }
 
     fn persist(&self) -> Result<(), String> {
@@ -720,13 +710,10 @@ impl Manager {
             }
         };
 
-        // Invalidate watchers from a previous run of this node.
-        let generation = self.bump_generation(id);
+        // Allocate a new generation while holding the Stop transition gate.
         let transition_gate = self.lifecycle_gate(id);
         let _transition = transition_gate.lock();
-        if !self.generation_is_current(id, generation) {
-            return self.cancelled_start(silent);
-        }
+        let generation = self.bump_generation(id);
 
         let kernel = self.kernel_path();
         if !kernel.exists() {
@@ -1046,17 +1033,21 @@ impl Manager {
     }
 
     pub fn stop(&self, id: &str, silent: bool) -> Result<Vec<ProxyNode>, String> {
-        // A Stop either cancels a slow selection or waits for its short spawn phase.
-        let transition_gate = self.lifecycle_gate(id);
-        let _transition = transition_gate.lock();
-        {
-            let nodes = self.nodes.lock();
-            if nodes.iter().find(|n| n.id == id).is_none() {
-                if silent {
-                    return Ok(self.list());
-                }
-                return Err("节点不存在".into());
-            }
+        let gate = self.lifecycle_gate(id);
+        let _transition = gate.lock();
+        self.stop_locked(id, silent)
+    }
+
+    // Caller must hold the per-node lifecycle gate. Used by failover to
+    // validate node state and stop it atomically.
+    fn stop_locked(&self, id: &str, silent: bool) -> Result<Vec<ProxyNode>, String> {
+        let exists = self.nodes.lock().iter().any(|n| n.id == id);
+        if !exists {
+            return if silent {
+                Ok(self.list())
+            } else {
+                Err("节点不存在".into())
+            };
         }
 
         self.bump_generation(id);
@@ -1925,13 +1916,19 @@ impl Manager {
 
     /// Re-resolve candidates, pick fastest reachable IP, restart process if needed.
     pub fn failover_upstream(&self, id: &str) -> Result<(), String> {
-        let node = {
+        // Record the generation before slow network probes, so results from
+        // an old node session cannot resurrect a user-stopped connection.
+        let gate = self.lifecycle_gate(id);
+        let (node, observed_generation) = {
+            let _transition = gate.lock();
             let nodes = self.nodes.lock();
-            nodes
+            let node = nodes
                 .iter()
                 .find(|n| n.id == id)
                 .cloned()
-                .ok_or_else(|| "节点不存在".to_string())?
+                .ok_or_else(|| "节点不存在".to_string())?;
+            let generation = self.generations.lock().get(id).copied().unwrap_or(0);
+            (node, generation)
         };
         if node.status != NodeStatus::Running {
             return Err("节点未运行".into());
@@ -1979,6 +1976,17 @@ impl Manager {
             return Ok(());
         }
 
+        // Hold the gate across validation and Stop. Manual user actions that
+        // happened during selection invalidate this failover generation.
+        let _transition = gate.lock();
+        let now_generation = self.generations.lock().get(id).copied().unwrap_or(0);
+        let same_running_node = self.nodes.lock().iter().any(|n| {
+            n.id == id && n.status == NodeStatus::Running
+                && n.server == node.server && n.port == node.port
+        });
+        if now_generation != observed_generation || !same_running_node {
+            return Err("节点状态已变化，取消过期的自动切换".into());
+        }
         self.append_log(
             id,
             format!("failover: {current} → {best_ip} ({ms}ms{speed_part}), restarting …"),
@@ -1996,15 +2004,12 @@ impl Manager {
                 });
             }
         }
-        let _ = self.persist();
-
-        let _ = self.stop(id, true);
-        // start() will call select_upstream_ip again — temporarily mark prefer path
-        // to reuse the IP we just chose by writing active and short-circuiting via
-        // a one-shot: set server path by pre-seeding last pick through active_ip
-        // and a sticky note in logs. select_upstream_ip always re-probes; for
-        // failover restart we want to keep best_ip. Use a forced start path.
-        self.start_with_upstream(id, &best_ip, true)?;
+        self.persist()?;
+        self.stop_locked(id, true)?;
+        let stop_generation = self.generations.lock().get(id).copied().unwrap_or(0);
+        drop(_transition);
+        // Start only if no user Stop or edit intervened after failover's Stop.
+        self.start_with_upstream(id, &best_ip, true, Some(stop_generation))?;
         Ok(())
     }
 
@@ -2056,15 +2061,8 @@ impl Manager {
         id: &str,
         upstream_host: &str,
         silent: bool,
+        expected_generation: Option<u64>,
     ) -> Result<Vec<ProxyNode>, String> {
-        let status = {
-            let nodes = self.nodes.lock();
-            nodes.iter().find(|n| n.id == id).ok_or("节点不存在")?.status.clone()
-        };
-        if status == NodeStatus::Running && self.processes.lock().contains_key(id) {
-            return Ok(self.list());
-        }
-
         let _guard = match self.begin_start_guard(id) {
             Some(g) => g,
             None => {
@@ -2075,13 +2073,21 @@ impl Manager {
             }
         };
 
-        // Invalidate watchers from a previous run of this node.
-        let generation = self.bump_generation(id);
         let transition_gate = self.lifecycle_gate(id);
         let _transition = transition_gate.lock();
-        if !self.generation_is_current(id, generation) {
-            return self.cancelled_start(silent);
+        if let Some(expected) = expected_generation {
+            if self.generations.lock().get(id).copied().unwrap_or(0) != expected {
+                return self.cancelled_start(silent);
+            }
         }
+        let status = {
+            let nodes = self.nodes.lock();
+            nodes.iter().find(|n| n.id == id).ok_or("节点不存在")?.status.clone()
+        };
+        if status == NodeStatus::Running && self.processes.lock().contains_key(id) {
+            return Ok(self.list());
+        }
+        let generation = self.bump_generation(id);
 
         let kernel = self.kernel_path();
         if !kernel.exists() {
@@ -2474,6 +2480,31 @@ mod tests {
     }
 
     #[test]
+    fn stopping_an_absent_node_returns_without_deadlocking() {
+        let (manager, dir, _) = test_manager(false);
+        assert!(manager.stop("missing-node-id", true).unwrap().len() == 1);
+        assert!(manager.stop("missing-node-id", false).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn user_stop_cancels_a_stale_failover_restart() {
+        let (manager, dir, id) = test_manager(true);
+        manager.nodes.lock()[0].status = NodeStatus::Running;
+        let old_generation = manager.bump_generation(&id);
+        manager.stop(&id, true).unwrap();
+        assert!(!manager.generation_is_current(&id, old_generation));
+
+        // An obsolete failover must not spawn a new process after user Stop.
+        let state = manager
+            .start_with_upstream(&id, "127.0.0.1", true, Some(old_generation))
+            .unwrap();
+        assert_eq!(state[0].status, NodeStatus::Stopped);
+        assert!(manager.processes.lock().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn disabled_nodes_are_not_started_by_start_all() {
         let (manager, dir, id) = test_manager(false);
         manager.start_all().unwrap();
@@ -2542,7 +2573,7 @@ mod tests {
 
         assert_eq!(manager.start(&id, false).unwrap()[0].status, NodeStatus::Running);
         assert_eq!(
-            manager.start_with_upstream(&id, "127.0.0.1", false).unwrap()[0].status,
+            manager.start_with_upstream(&id, "127.0.0.1", false, None).unwrap()[0].status,
             NodeStatus::Running
         );
         assert_eq!(manager.processes.lock().len(), 1);

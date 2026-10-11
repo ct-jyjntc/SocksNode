@@ -114,24 +114,20 @@ impl AppSettings {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| e.to_string())?;
-        // The file holds the iLatency session cookie; keep it private to the user.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        crate::secure_store::write_private(&path, json.as_bytes())
     }
 
     pub fn to_view(&self, username: Option<String>, launch_at_login_active: bool) -> AppSettingsView {
         let cookie = self.ilatency_cookie.trim();
-        let preview = if cookie.is_empty() {
+        let cookie_chars: Vec<char> = cookie.chars().collect();
+        let preview = if cookie_chars.is_empty() {
             String::new()
-        } else if cookie.len() <= 18 {
+        } else if cookie_chars.len() <= 18 {
             "***".into()
         } else {
-            format!("{}…{}", &cookie[..8], &cookie[cookie.len() - 6..])
+            let head: String = cookie_chars[..8].iter().collect();
+            let tail: String = cookie_chars[cookie_chars.len() - 6..].iter().collect();
+            format!("{head}…{tail}")
         };
         AppSettingsView {
             has_ilatency_cookie: !cookie.is_empty(),
@@ -164,4 +160,20 @@ pub struct AppSettingsPatch {
     pub launch_at_login: Option<bool>,
     pub start_minimized: Option<bool>,
     pub auto_start_nodes: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_cookie_preview_is_utf8_safe() {
+        let settings = AppSettings {
+            ilatency_cookie: "session=测试测试测试测试测试测试测试测试测试测试".into(),
+            ..AppSettings::default()
+        };
+        let view = settings.to_view(None, false);
+        assert!(view.has_ilatency_cookie);
+        assert!(view.ilatency_cookie_preview.contains('…'));
+    }
 }

@@ -3,6 +3,7 @@ mod ip_probe;
 mod manager;
 mod models;
 mod net_bind;
+mod secure_store;
 mod settings;
 mod speed_select;
 
@@ -285,10 +286,15 @@ fn apply_launch_at_login(app: &AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn settings_get(app: AppHandle, state: tauri::State<'_, AppState>) -> AppSettingsView {
-    state
-        .manager
-        .get_settings_view(autostart_is_enabled(&app))
+async fn settings_get(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppSettingsView, String> {
+    let manager = Arc::clone(&state.manager);
+    let active = autostart_is_enabled(&app);
+    tauri::async_runtime::spawn_blocking(move || manager.get_settings_view(active))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -299,17 +305,17 @@ async fn settings_update(
 ) -> Result<AppSettingsView, String> {
     let manager = Arc::clone(&state.manager);
     let active_before = autostart_is_enabled(&app);
-    let updated = tauri::async_runtime::spawn_blocking(move || {
+    let mut updated = tauri::async_runtime::spawn_blocking(move || {
         manager.update_settings(patch, active_before)
     })
     .await
     .map_err(|e| e.to_string())??;
 
-    // Sync OS login item with saved preference.
+    // Sync OS login item with saved preference. Reuse the resolved view:
+    // querying it again would make another potentially slow iLatency API call.
     apply_launch_at_login(&app, updated.launch_at_login)?;
-    Ok(state
-        .manager
-        .get_settings_view(autostart_is_enabled(&app)))
+    updated.launch_at_login_active = autostart_is_enabled(&app);
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -366,7 +372,7 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             // Login item always passes this flag; we only honor it when
             // startMinimized is on. Manual / Dock launches have no flag.
-            Some(vec!["--minimized".into()]),
+            Some(vec!["--minimized"]),
         ))
         .setup(|app| {
             let (data_dir, resources_dir) = resolve_paths(app.handle());
@@ -446,12 +452,10 @@ pub fn run() {
                 }
                 #[cfg(target_os = "macos")]
                 RunEvent::Reopen {
-                    has_visible_windows,
+                    has_visible_windows: false,
                     ..
                 } => {
-                    if !has_visible_windows {
-                        show_main_window(app_handle);
-                    }
+                    show_main_window(app_handle);
                 }
                 _ => {}
             }

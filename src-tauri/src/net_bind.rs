@@ -7,12 +7,23 @@
 use std::ffi::CString;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::Value;
 use socket2::{Domain, Protocol, Socket, Type};
+
+/// Remove short-lived curl header files, including on early return.
+/// Their contents are mode 0600 and are never passed as process arguments.
+struct TemporaryCurlHeaders(PathBuf);
+
+impl Drop for TemporaryCurlHeaders {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PhysicalEgress {
@@ -332,9 +343,26 @@ pub fn curl_json_direct(
         "--resolve",
         &format!("{host}:{port}:{ip}"),
     ]);
+    // Never put the iLatency session Cookie in curl's command line: ps can
+    // reveal -H arguments. Curl supports reading headers from a private file.
+    let mut header_lines = String::new();
     for (k, v) in extra_headers {
-        cmd.args(["-H", &format!("{k}: {v}")]);
+        if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
+            return Err("HTTP 头包含不允许的换行符".into());
+        }
+        header_lines.push_str(&format!("{k}: {v}\n"));
     }
+    let _header_guard = if header_lines.is_empty() {
+        None
+    } else {
+        let path = std::env::temp_dir().join(format!(
+            "socksnode-curl-headers-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        crate::secure_store::write_private(&path, header_lines.as_bytes())?;
+        cmd.args(["-H", &format!("@{}", path.display())]);
+        Some(TemporaryCurlHeaders(path))
+    };
 
     let output = if let Some(json) = body {
         cmd.args([
@@ -580,7 +608,7 @@ fn tcping_once(ip_addr: IpAddr, port: u16, timeout: Duration) -> Option<u64> {
             let ms = start.elapsed().as_millis() as u64;
             // <12ms on a public proxy port is almost always transparent-proxy noise.
             // >1500ms is near-timeout jitter — treat as fail so one spike doesn't win/lose ranking.
-            if ms < 12 || ms > 1500 {
+            if !(12..=1500).contains(&ms) {
                 return None;
             }
             Some(ms)

@@ -246,7 +246,7 @@ pub fn rank_and_pick(
         .iter()
         .filter_map(|r| {
             let ms = r.ms?;
-            if ms < 12 || ms > 1500 {
+            if !(12..=1500).contains(&ms) {
                 return None;
             }
             Some((r.ip.clone(), ms))
