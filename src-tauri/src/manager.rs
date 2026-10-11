@@ -1219,6 +1219,9 @@ impl Manager {
         }
 
         let errors = errors.into_inner();
+        if self.batch_generation.load(Ordering::Acquire) != batch_generation {
+            return Err("批量启动已被停止或更新操作取消".into());
+        }
         if !errors.is_empty() {
             return Err(errors.join("\n"));
         }
@@ -2055,6 +2058,13 @@ impl Manager {
                 return Err(format!(
                     "最优 IP 仍是 {best_ip} 且不可达，保持当前进程"
                 ));
+            }
+            let _transition = gate.lock();
+            let still_valid = self.generations.lock().get(id).copied().unwrap_or(0)
+                == observed_generation
+                && self.nodes.lock().iter().any(|n| n.id == id && n.status == NodeStatus::Running);
+            if !still_valid {
+                return Err("节点状态已变化，取消过期的自动切换".into());
             }
             self.append_log(
                 id,
