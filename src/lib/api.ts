@@ -32,10 +32,15 @@ export const api = {
   testIlatency: () => invoke<string>("settings_test_ilatency"),
   onChanged: (cb: (nodes: ProxyNode[]) => void): (() => void) => {
     let unlisten: UnlistenFn | undefined;
-    listen<ProxyNode[]>("nodes:changed", (e) => cb(e.payload)).then((fn) => {
-      unlisten = fn;
-    });
+    let disposed = false;
+    void listen<ProxyNode[]>("nodes:changed", (e) => cb(e.payload))
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((error) => console.error("Failed to subscribe to node changes:", error));
     return () => {
+      disposed = true;
       unlisten?.();
     };
   },
@@ -43,12 +48,18 @@ export const api = {
     cb: (payload: { id: string; ts: string; line: string }) => void,
   ): (() => void) => {
     let unlisten: UnlistenFn | undefined;
-    listen<{ id: string; ts: string; line: string }>("nodes:log", (e) =>
-      cb(e.payload),
-    ).then((fn) => {
-      unlisten = fn;
-    });
+    let disposed = false;
+    void listen<{ id: string; ts: string; line: string }>(
+      "nodes:log",
+      (e) => cb(e.payload),
+    )
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((error) => console.error("Failed to subscribe to node logs:", error));
     return () => {
+      disposed = true;
       unlisten?.();
     };
   },

@@ -28,6 +28,8 @@ type SharedNodes = Arc<Mutex<Vec<ProxyNode>>>;
 type SharedSettings = Arc<Mutex<AppSettings>>;
 type SharedFailoverAt = Arc<Mutex<HashMap<String, Instant>>>;
 type SharedGenerations = Arc<Mutex<HashMap<String, u64>>>;
+/// Per-node transition locks: serialize process creation, status update and stopping.
+type SharedLifecycleGates = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 type SharedDnsCache = Arc<Mutex<HashMap<String, (Instant, Vec<String>)>>>;
 
 const TCPING_TIMEOUT: Duration = Duration::from_secs(2);
@@ -137,6 +139,7 @@ pub struct Manager {
     /// Per-node watcher generation; bumped on every start/stop so stale
     /// health/exit watchers terminate instead of piling up.
     generations: SharedGenerations,
+    lifecycle_gates: SharedLifecycleGates,
     is_shutting_down: Arc<Mutex<bool>>,
     app: Mutex<Option<AppHandle>>,
 }
@@ -159,6 +162,7 @@ impl Manager {
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
             starting_ids: Arc::new(Mutex::new(HashSet::new())),
             generations: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_gates: Arc::new(Mutex::new(HashMap::new())),
             is_shutting_down: Arc::new(Mutex::new(false)),
             app: Mutex::new(None),
         }
@@ -345,6 +349,28 @@ impl Manager {
         let entry = map.entry(id.to_string()).or_insert(0);
         *entry = entry.wrapping_add(1);
         *entry
+    }
+
+    /// Only the transition phase is locked, never network discovery or speed tests.
+    fn lifecycle_gate(&self, id: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.lifecycle_gates
+                .lock()
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    fn generation_is_current(&self, id: &str, generation: u64) -> bool {
+        self.generations.lock().get(id).copied() == Some(generation)
+    }
+
+    fn cancelled_start(&self, silent: bool) -> Result<Vec<ProxyNode>, String> {
+        if silent {
+            Ok(self.list())
+        } else {
+            Err("节点启动已取消".into())
+        }
     }
 
     fn begin_start_guard(&self, id: &str) -> Option<StartGuard> {
@@ -575,16 +601,19 @@ impl Manager {
     }
 
     pub fn update(&self, id: &str, patch: NodeInput) -> Result<Vec<ProxyNode>, String> {
-        let was_running = {
+        // Validate before touching a live process. Invalid edits must not cause downtime.
+        let data = self.normalize_input(&patch, Some(id))?;
+        let (was_running, was_starting) = {
             let nodes = self.nodes.lock();
             let node = nodes.iter().find(|n| n.id == id).ok_or("节点不存在")?;
-            node.status == NodeStatus::Running
+            (
+                node.status == NodeStatus::Running,
+                node.status == NodeStatus::Starting,
+            )
         };
-        if was_running {
-            let _ = self.stop(id, true);
+        if was_running || was_starting {
+            self.stop(id, true)?;
         }
-
-        let data = self.normalize_input(&patch, Some(id))?;
         {
             let mut nodes = self.nodes.lock();
             let node = nodes.iter_mut().find(|n| n.id == id).ok_or("节点不存在")?;
@@ -627,7 +656,7 @@ impl Manager {
             nodes
                 .iter()
                 .find(|n| n.id == id)
-                .map(|n| n.status == NodeStatus::Running)
+                .map(|n| matches!(n.status, NodeStatus::Running | NodeStatus::Starting))
                 .ok_or_else(|| "节点不存在".to_string())?
         };
         if running {
@@ -672,16 +701,13 @@ impl Manager {
     }
 
     pub fn start(&self, id: &str, silent: bool) -> Result<Vec<ProxyNode>, String> {
-        {
+        let status = {
             let nodes = self.nodes.lock();
-            let node = nodes.iter().find(|n| n.id == id).ok_or("节点不存在")?;
-            if node.status == NodeStatus::Running {
-                // Already running and process tracked — no-op.
-                if self.processes.lock().contains_key(id) {
-                    return Ok(self.list());
-                }
-                // Status says running but process missing — fall through to restart.
-            }
+            nodes.iter().find(|n| n.id == id).ok_or("节点不存在")?.status.clone()
+        };
+        // Never nest nodes -> processes locks: exit handling uses the reverse order.
+        if status == NodeStatus::Running && self.processes.lock().contains_key(id) {
+            return Ok(self.list());
         }
 
         let _guard = match self.begin_start_guard(id) {
@@ -696,6 +722,11 @@ impl Manager {
 
         // Invalidate watchers from a previous run of this node.
         let generation = self.bump_generation(id);
+        let transition_gate = self.lifecycle_gate(id);
+        let _transition = transition_gate.lock();
+        if !self.generation_is_current(id, generation) {
+            return self.cancelled_start(silent);
+        }
 
         let kernel = self.kernel_path();
         if !kernel.exists() {
@@ -758,7 +789,14 @@ impl Manager {
             Err(e) => return self.abort_start(id, e, silent),
         };
         let listen = node_snapshot.listen_addr();
-        let upstream_host = match self.select_upstream_ip(&node_snapshot) {
+        // Allow Stop to cancel a potentially slow DNS / speed-selection phase.
+        drop(_transition);
+        let selected = self.select_upstream_ip(&node_snapshot);
+        let _transition = transition_gate.lock();
+        if !self.generation_is_current(id, generation) {
+            return self.cancelled_start(silent);
+        }
+        let upstream_host = match selected {
             Ok(ip) => ip,
             Err(e) => return self.abort_start(id, ["IP 优选失败: ", e.as_str()].concat(), silent),
         };
@@ -1008,6 +1046,9 @@ impl Manager {
     }
 
     pub fn stop(&self, id: &str, silent: bool) -> Result<Vec<ProxyNode>, String> {
+        // A Stop either cancels a slow selection or waits for its short spawn phase.
+        let transition_gate = self.lifecycle_gate(id);
+        let _transition = transition_gate.lock();
         {
             let nodes = self.nodes.lock();
             if nodes.iter().find(|n| n.id == id).is_none() {
@@ -1058,7 +1099,7 @@ impl Manager {
             .nodes
             .lock()
             .iter()
-            .filter(|n| n.status != NodeStatus::Running)
+            .filter(|n| n.enabled && n.status != NodeStatus::Running)
             .map(|n| n.id.clone())
             .collect();
         if ids.is_empty() {
@@ -1746,6 +1787,7 @@ impl Manager {
         let dns_cache = Arc::clone(&self.dns_cache);
         let starting_ids = Arc::clone(&self.starting_ids);
         let generations = Arc::clone(&self.generations);
+        let lifecycle_gates = Arc::clone(&self.lifecycle_gates);
         let shutting = Arc::clone(&self.is_shutting_down);
         let app = self.app.lock().clone();
         // Manager methods need self — re-enter via a lightweight helper object.
@@ -1771,6 +1813,7 @@ impl Manager {
                 starting_ids: Arc::clone(&starting_ids),
                 is_shutting_down: Arc::clone(&shutting),
                 generations: Arc::clone(&generations),
+                lifecycle_gates: Arc::clone(&lifecycle_gates),
                 app: Mutex::new(app.clone()),
             };
 
@@ -2014,12 +2057,12 @@ impl Manager {
         upstream_host: &str,
         silent: bool,
     ) -> Result<Vec<ProxyNode>, String> {
-        {
+        let status = {
             let nodes = self.nodes.lock();
-            let node = nodes.iter().find(|n| n.id == id).ok_or("节点不存在")?;
-            if node.status == NodeStatus::Running && self.processes.lock().contains_key(id) {
-                return Ok(self.list());
-            }
+            nodes.iter().find(|n| n.id == id).ok_or("节点不存在")?.status.clone()
+        };
+        if status == NodeStatus::Running && self.processes.lock().contains_key(id) {
+            return Ok(self.list());
         }
 
         let _guard = match self.begin_start_guard(id) {
@@ -2034,6 +2077,11 @@ impl Manager {
 
         // Invalidate watchers from a previous run of this node.
         let generation = self.bump_generation(id);
+        let transition_gate = self.lifecycle_gate(id);
+        let _transition = transition_gate.lock();
+        if !self.generation_is_current(id, generation) {
+            return self.cancelled_start(silent);
+        }
 
         let kernel = self.kernel_path();
         if !kernel.exists() {
@@ -2394,5 +2442,112 @@ pub fn open_path(path: &str) -> Result<(), String> {
             .spawn()
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_manager(enabled: bool) -> (Manager, PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("socksnode-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = Manager::new(dir.clone(), dir.join("resources"));
+        let nodes = manager
+            .create(NodeInput {
+                name: "Test node".into(),
+                proxy_type: "anytls".into(),
+                server: "127.0.0.1".into(),
+                port: 443,
+                password: "test-only-password".into(),
+                udp: true,
+                sni: "example.com".into(),
+                skip_cert_verify: false,
+                local_port: 58983,
+                enabled,
+                prefer_fastest_ip: false,
+                lan_access: false,
+            })
+            .unwrap();
+        let id = nodes[0].id.clone();
+        (manager, dir, id)
+    }
+
+    #[test]
+    fn disabled_nodes_are_not_started_by_start_all() {
+        let (manager, dir, id) = test_manager(false);
+        manager.start_all().unwrap();
+        assert_eq!(
+            manager.list().into_iter().find(|node| node.id == id).unwrap().status,
+            NodeStatus::Stopped
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_edit_must_not_stop_running_node() {
+        let (manager, dir, id) = test_manager(true);
+        manager.nodes.lock()[0].status = NodeStatus::Running;
+        let mut patch = manager.list()[0].clone();
+        patch.server.clear();
+        let error = manager
+            .update(
+                &id,
+                NodeInput {
+                    name: patch.name,
+                    proxy_type: patch.proxy_type,
+                    server: patch.server,
+                    port: patch.port,
+                    password: patch.password,
+                    udp: patch.udp,
+                    sni: patch.sni,
+                    skip_cert_verify: patch.skip_cert_verify,
+                    local_port: patch.local_port,
+                    enabled: patch.enabled,
+                    prefer_fastest_ip: patch.prefer_fastest_ip,
+                    lan_access: patch.lan_access,
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("服务器地址"));
+        assert_eq!(manager.nodes.lock()[0].status, NodeStatus::Running);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stopping_invalidates_a_pending_start() {
+        let (manager, dir, id) = test_manager(true);
+        let generation = manager.bump_generation(&id);
+        manager.nodes.lock()[0].status = NodeStatus::Starting;
+
+        manager.stop(&id, true).unwrap();
+
+        assert!(!manager.generation_is_current(&id, generation));
+        assert_eq!(manager.nodes.lock()[0].status, NodeStatus::Stopped);
+        assert!(manager.cancelled_start(false).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_start_does_not_lock_nodes_twice() {
+        let (manager, dir, id) = test_manager(true);
+        let child = Command::new("sleep")
+            .arg("20")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        manager.processes.lock().insert(id.clone(), child);
+        manager.nodes.lock()[0].status = NodeStatus::Running;
+
+        assert_eq!(manager.start(&id, false).unwrap()[0].status, NodeStatus::Running);
+        assert_eq!(
+            manager.start_with_upstream(&id, "127.0.0.1", false).unwrap()[0].status,
+            NodeStatus::Running
+        );
+        assert_eq!(manager.processes.lock().len(), 1);
+        let mut child = manager.processes.lock().remove(&id).unwrap();
+        kill_child_process(&mut child);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -251,7 +251,18 @@ export default function App() {
       setLogs([]);
       return;
     }
-    api.logs(selectedId).then(setLogs).catch(() => setLogs([]));
+    // Ignore responses for a previously selected node.
+    let active = true;
+    api.logs(selectedId)
+      .then((entries) => {
+        if (active) setLogs(entries);
+      })
+      .catch(() => {
+        if (active) setLogs([]);
+      });
+    return () => {
+      active = false;
+    };
   }, [selectedId]);
 
   const stats = useMemo(() => {
@@ -429,16 +440,17 @@ export default function App() {
         selectedIdRef.current = id;
         try {
           const existing = await api.logs(id);
-          setLogs(existing);
+          if (selectedIdRef.current === id) setLogs(existing);
         } catch {
-          setLogs([]);
+          if (selectedIdRef.current === id) setLogs([]);
         }
       }
       await new Promise<void>((r) => requestAnimationFrame(() => r()));
       if (action === "start") {
         await api.start(id);
         try {
-          setLogs(await api.logs(id));
+          const entries = await api.logs(id);
+          if (selectedIdRef.current === id) setLogs(entries);
         } catch {
           /* ignore */
         }
@@ -469,7 +481,8 @@ export default function App() {
       } else if (action === "reselect") {
         await api.reselect(id);
         try {
-          setLogs(await api.logs(id));
+          const entries = await api.logs(id);
+          if (selectedIdRef.current === id) setLogs(entries);
         } catch {
           /* ignore */
         }
@@ -485,7 +498,8 @@ export default function App() {
       notify(err instanceof Error ? err.message : "操作失败", "danger");
       try {
         if (selectedIdRef.current === id) {
-          setLogs(await api.logs(id));
+          const entries = await api.logs(id);
+          if (selectedIdRef.current === id) setLogs(entries);
         }
       } catch {
         /* ignore */
