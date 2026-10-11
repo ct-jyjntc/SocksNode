@@ -1,1438 +1,546 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
-import {
-  Activity,
-  FolderOpen,
-  Moon,
-  Play,
-  Plus,
-  Square,
-  Sun,
-  Terminal,
-  Trash2,
-  Pencil,
-  Copy,
-  RefreshCw,
-  Settings,
-} from "lucide-react";
-import {
-  Badge,
-  Button,
-  Checkbox,
-  Dialog,
-  Input,
-  Label,
-  Spinner,
-} from "@/components/ui";
-import { WindowControls } from "@/components/WindowControls";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ChevronDown, ChevronRight, Check, Copy, FolderOpen, GitBranch, Moon, Plus, RefreshCw, Search, Settings2, Sun, X, Network, Activity, RotateCcw } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api } from "@/lib/api";
-import type {
-  AppInfo,
-  AppSettingsView,
-  LogEntry,
-  NodeInput,
-  ProxyNode,
-} from "@/lib/types";
-import { cn, statusLabel } from "@/lib/utils";
+import { api } from "./lib/api";
+import type { AppInfo, AppSettingsPatch, AppSettingsView, LogEntry, NodeInput, ProxyNode, SelectStrategy } from "./lib/types";
 
-const emptyForm: NodeInput = {
-  name: "",
-  type: "anytls",
-  server: "",
-  port: 443,
-  password: "",
-  udp: true,
-  sni: "www.icloud.com",
-  skipCertVerify: true,
-  localPort: 5003,
-  preferFastestIp: true,
-  lanAccess: false,
-};
+type Page = "nodes" | "upstreams" | "gateway" | "routing" | "latency" | "logs" | "settings";
+type SettingsTab = "general" | "select" | "network" | "ilatency" | "about";
+type Tone = "ok" | "err" | "warn";
+type Theme = "system" | "light" | "dark";
+type LogFilter = "all" | "ok" | "warn";
 
-function useTheme() {
-  const [dark, setDark] = useState(() => {
-    if (typeof window === "undefined") return false;
-    const saved = localStorage.getItem("socksnode.theme");
-    if (saved === "dark") return true;
-    if (saved === "light") return false;
-    return window.matchMedia("(prefers-color-scheme: dark)").matches;
-  });
-
-  useEffect(() => {
-    document.documentElement.classList.toggle("dark", dark);
-    localStorage.setItem("socksnode.theme", dark ? "dark" : "light");
-  }, [dark]);
-
-  return { dark, setDark };
+const NAV: [Page, string][] = [["nodes", "节点"], ["upstreams", "上游"], ["gateway", "网关"], ["routing", "优选"], ["latency", "延迟"], ["logs", "日志"]];
+const STRATEGIES: [SelectStrategy, string][] = [["throughput", "高带宽"], ["balanced", "均衡"], ["latency", "低延迟"]];
+const SNI_PRESETS = ["www.icloud.com", "gateway.icloud.com", "www.microsoft.com", "www.apple.com", "dl.google.com"];
+const BASE_FORM: NodeInput = { name: "", type: "anytls", server: "", port: 443, password: "", sni: "www.icloud.com", localPort: 5001, enabled: true, udp: true, preferFastestIp: true, skipCertVerify: true, lanAccess: false };
+const cn = (...values: (string | false | null | undefined)[]) => values.filter(Boolean).join(" ");
+const flag = (name: string) => /香港|hk\b/i.test(name) ? "🇭🇰" : /日本|东京|大阪|jp\b/i.test(name) ? "🇯🇵" : /新加坡|sg\b/i.test(name) ? "🇸🇬" : /美国|洛杉矶|us\b/i.test(name) ? "🇺🇸" : /德国|法兰克福|de\b/i.test(name) ? "🇩🇪" : /台湾|tw\b/i.test(name) ? "🇹🇼" : /韩国|首尔|kr\b/i.test(name) ? "🇰🇷" : "🌐";
+const dotClass = (status: ProxyNode["status"]) => status === "running" ? "on" : status === "error" ? "err" : status === "starting" || status === "stopping" ? "busy" : "";
+const latClass = (value: number | null | undefined) => value == null ? "" : value < 100 ? "lat-g" : value < 250 ? "lat-y" : "lat-r";
+const runtimeLatency = (node: ProxyNode) => node.lastTest?.ok ? node.lastTest.ms : node.lastProbe?.ms ?? null;
+const fmtTime = (value: string) => { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString("zh-CN", { hour12: false }); };
+const errMessage = (error: unknown) => error instanceof Error ? error.message : String(error || "操作失败");
+function nextPort(nodes: ProxyNode[]) { const used = new Set(nodes.map(n => n.localPort)); let p = 5001; while (used.has(p) && p < 65535) p++; return p; }
+function toInput(node: ProxyNode): NodeInput { return { name: node.name, type: "anytls", server: node.server, port: node.port, password: node.password, sni: node.sni, localPort: node.localPort, enabled: node.enabled, udp: node.udp, preferFastestIp: node.preferFastestIp, skipCertVerify: node.skipCertVerify, lanAccess: node.lanAccess }; }
+function anytlsLink(node: ProxyNode) {
+  const url = new URL("anytls://placeholder");
+  url.hostname = node.server.includes(":") && !node.server.startsWith("[") ? "[" + node.server + "]" : node.server;
+  url.port = String(node.port);
+  url.username = encodeURIComponent(node.password);
+  url.searchParams.set("sni", node.sni);
+  url.hash = encodeURIComponent(node.name);
+  return url.toString();
 }
-
-function statusTone(status: string): "success" | "danger" | "muted" | "warn" {
-  if (status === "running") return "success";
-  if (status === "error") return "danger";
-  if (status === "starting" || status === "stopping") return "warn";
-  return "muted";
+function readAnytlsLink(text: string): Partial<NodeInput> {
+  const url = new URL(text.trim());
+  if (url.protocol !== "anytls:" || !url.hostname || !url.port || !url.username) throw new Error("请输入包含密码、服务器和端口的 anytls:// 链接");
+  const port = Number(url.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("远程端口无效");
+  return { name: decodeURIComponent(url.hash.slice(1)) || url.hostname, server: url.hostname.replace(/^\[|\]$/g, ""), port, password: decodeURIComponent(url.username), sni: url.searchParams.get("sni") || "www.icloud.com" };
 }
-
-function StatusDot({ status }: { status: string }) {
-  return (
-    <span
-      className={cn(
-        "mt-0.5 size-1.5 shrink-0 rounded-full",
-        status === "running" && "bg-success",
-        status === "error" && "bg-destructive",
-        (status === "starting" || status === "stopping") &&
-          "animate-pulse bg-amber-500",
-        status !== "running" &&
-          status !== "error" &&
-          status !== "starting" &&
-          status !== "stopping" &&
-          "bg-muted-foreground/40",
-      )}
-      aria-hidden
-    />
-  );
+function IconBtn({ title, onClick, children, disabled }: { title: string; onClick: () => void; children: ReactNode; disabled?: boolean }) {
+  return <button className="icon" title={title} aria-label={title} disabled={disabled} onClick={onClick}>{children}</button>;
 }
-
-export default function App() {
-  const { dark, setDark } = useTheme();
+function TextBtn({ children, onClick, kind, disabled, title }: { children: ReactNode; onClick: () => void; kind?: "primary" | "action" | "danger"; disabled?: boolean; title?: string }) {
+  return <button className={cn("text", kind)} title={title} disabled={disabled} onClick={onClick}>{children}</button>;
+}
+function Toggle({ checked, onClick, busy, label, disabled }: { checked: boolean; onClick: () => void; busy?: boolean; label: string; disabled?: boolean }) {
+  return <button role="switch" aria-checked={checked} aria-label={label} title={label} className={cn("tg", checked && "on", busy && "busy")} disabled={disabled || busy} onClick={onClick} />;
+}
+function RowHead({ label, right }: { label: string; right?: ReactNode }) { return <div className="row-head"><span className="label">{label}</span><span className="grow" />{right}</div>; }
+function Empty({ title, children, action }: { title: string; children?: ReactNode; action?: ReactNode }) { return <div className="list"><div className="empty-state"><b>{title}</b>{children}{action && <div style={{ marginTop: 12 }}>{action}</div>}</div></div>; }
+function PrefRow({ title, description, control }: { title: string; description: ReactNode; control: ReactNode }) { return <div className="row pref"><div className="who"><div className="name">{title}</div><div className="sub wrap">{description}</div></div>{control}</div>; }
+function Segment<T extends string>({ value, options, onChange, disabled }: { value: T; options: [T, string][]; onChange: (value: T) => void; disabled?: boolean }) {
+  return <div className="segs">{options.map(([key, text]) => <button key={key} className={cn(value === key && "on")} disabled={disabled} onClick={() => onChange(key)}>{text}</button>)}</div>;
+}
+function Field({ label, children }: { label: string; children: ReactNode }) { return <><label>{label}</label>{children}</>; }
+function NumericSetting({ value, unit, min, max, disabled, onSave }: { value: number; unit: string; min: number; max: number; disabled: boolean; onSave: (v: number) => void }) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]);
+  const commit = () => {
+    const n = Number(draft);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < min || n > max) { setDraft(String(value)); return; }
+    if (n !== value) onSave(n);
+  };
+  return <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}><input className="numin" type="number" min={min} max={max} value={draft} disabled={disabled} onChange={e => setDraft(e.target.value)} onBlur={commit} onKeyDown={e => { if (e.key === "Enter") e.currentTarget.blur(); }}/><span className="unit">{unit}</span></span>;
+}
+function App() {
+  const [page, setPage] = useState<Page>("nodes");
+  const [setTab, setSetTab] = useState<SettingsTab>("general");
   const [nodes, setNodes] = useState<ProxyNode[]>([]);
   const [info, setInfo] = useState<AppInfo | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [busyId, setBusyId] = useState<string | null>(null);
-  const [busyAction, setBusyAction] = useState<
-    "start" | "stop" | "remove" | "test" | "reselect" | null
-  >(null);
-  const [globalBusy, setGlobalBusy] = useState(false);
-  const [globalBusyLabel, setGlobalBusyLabel] = useState("");
-  const [refreshing, setRefreshing] = useState(false);
-  const [settingsBusy, setSettingsBusy] = useState(false);
-  const [settingsBusyLabel, setSettingsBusyLabel] = useState("");
-  const [dialogOpen, setDialogOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [editing, setEditing] = useState<ProxyNode | null>(null);
-  const [form, setForm] = useState<NodeInput>(emptyForm);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [query, setQuery] = useState("");
   const [settings, setSettings] = useState<AppSettingsView | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState("");
+  const [folded, setFolded] = useState(true);
+  const [editorId, setEditorId] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [form, setForm] = useState<NodeInput>(BASE_FORM);
+  const [importUrl, setImportUrl] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [logFilter, setLogFilter] = useState<LogFilter>("all");
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [cookieDraft, setCookieDraft] = useState("");
-  const [healthInterval, setHealthInterval] = useState(5);
-  const [failoverCooldown, setFailoverCooldown] = useState(60);
-  const [selectStrategy, setSelectStrategy] = useState("throughput");
-  const [speedTopK, setSpeedTopK] = useState(3);
-  const [speedTestMb, setSpeedTestMb] = useState(1);
-  const [launchAtLogin, setLaunchAtLogin] = useState(false);
-  const [startMinimized, setStartMinimized] = useState(false);
-  const [autoStartNodes, setAutoStartNodes] = useState(false);
-  const selectedIdRef = useRef<string | null>(null);
-  const logEndRef = useRef<HTMLDivElement | null>(null);
-  const flashTimerRef = useRef<number | null>(null);
-  const [flash, setFlash] = useState<{
-    text: string;
-    tone: "success" | "danger" | "muted";
-  } | null>(null);
+  const [wirePaths, setWirePaths] = useState<{ d: string; color: string; dashed?: boolean }[]>([]);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [flash, setFlash] = useState<{ text: string; tone: Tone } | null>(null);
+  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem("socksnode.theme.v3") as Theme) || (localStorage.getItem("socksnode.theme") as Theme) || "system");
+  const logIdRef = useRef<string | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeRef = useRef(true);
 
-  const notify = useCallback(
-    (text: string, tone: "success" | "danger" | "muted" = "muted") => {
-      setFlash({ text, tone });
-      if (flashTimerRef.current != null) {
-        window.clearTimeout(flashTimerRef.current);
-      }
-      flashTimerRef.current = window.setTimeout(() => {
-        setFlash(null);
-        flashTimerRef.current = null;
-      }, 3600);
-    },
-    [],
-  );
-
-  useEffect(() => {
-    selectedIdRef.current = selectedId;
-  }, [selectedId]);
-
-  useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
-
-  useEffect(() => {
-    return () => {
-      if (flashTimerRef.current != null) {
-        window.clearTimeout(flashTimerRef.current);
-      }
-    };
+  const toast = useCallback((text: string, tone: Tone = "ok") => {
+    setFlash({ text, tone });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setFlash(null), 3200);
   }, []);
 
   const refresh = useCallback(async () => {
-    setRefreshing(true);
-    try {
-      const list = await api.list();
-      setNodes(list);
-    } finally {
-      setRefreshing(false);
-      setLoading(false);
-    }
-  }, []);
-
-  const withGlobalBusy = useCallback(
-    async <T,>(label: string, fn: () => Promise<T>): Promise<T> => {
-      setGlobalBusy(true);
-      setGlobalBusyLabel(label);
-      await new Promise<void>((r) => requestAnimationFrame(() => r()));
-      try {
-        return await fn();
-      } finally {
-        setGlobalBusy(false);
-        setGlobalBusyLabel("");
-      }
-    },
-    [],
-  );
-
-  useEffect(() => {
-    let active = true;
-    let unsubChanged = () => {};
-    let unsubLog = () => {};
-
-    (async () => {
-      try {
-        const [list, appInfo, appSettings] = await Promise.all([
-          api.list(),
-          api.getInfo(),
-          api.getSettings(),
-        ]);
-        if (!active) return;
-        setNodes(list);
-        setInfo(appInfo);
-        setSettings(appSettings);
-        setHealthInterval(appSettings.healthIntervalSecs);
-        setFailoverCooldown(appSettings.failoverCooldownSecs);
-        setSelectStrategy(appSettings.selectStrategy || "throughput");
-        setSpeedTopK(appSettings.speedTopK || 3);
-        setSpeedTestMb(
-          Math.max(0.25, (appSettings.speedTestBytes || 1048576) / 1048576),
-        );
-        setLaunchAtLogin(Boolean(appSettings.launchAtLogin));
-        setStartMinimized(Boolean(appSettings.startMinimized));
-        setAutoStartNodes(Boolean(appSettings.autoStartNodes));
-        if (list[0]) setSelectedId(list[0].id);
-      } catch (err) {
-        if (active) notify(err instanceof Error ? err.message : "初始化失败", "danger");
-      } finally {
-        if (active) setLoading(false);
-      }
-    })();
-
-    unsubChanged = api.onChanged((list) => {
-      setNodes(list);
-    });
-
-    unsubLog = api.onLog((payload) => {
-      if (selectedIdRef.current === payload.id) {
-        setLogs((prev) => {
-          const next = [...prev, { ts: payload.ts, line: payload.line }];
-          return next.slice(-500);
-        });
-      }
-    });
-
-    return () => {
-      active = false;
-      unsubChanged();
-      unsubLog();
-    };
+    const list = await api.list();
+    if (!activeRef.current) return;
+    setNodes(list);
+    setSelectedId(prev => list.some(n => n.id === prev) ? prev : (list[0]?.id ?? null));
   }, []);
 
   useEffect(() => {
-    if (!selectedId) {
-      setLogs([]);
-      return;
-    }
-    // Ignore responses for a previously selected node.
+    let mounted = true;
+    activeRef.current = true;
+    let unChanged = () => {};
+    let unLog = () => {};
+    void Promise.all([api.list(), api.getInfo(), api.getSettings()]).then(([list, metadata, view]) => {
+      if (!mounted) return;
+      setNodes(list);
+      setInfo(metadata);
+      setSettings(view);
+      setSelectedId(list[0]?.id ?? null);
+    }).catch(e => { if (mounted) toast("初始化失败：" + errMessage(e), "err"); }).finally(() => { if (mounted) setLoading(false); });
+    unChanged = api.onChanged(list => {
+      if (!activeRef.current) return;
+      setNodes(list);
+      setSelectedId(prev => list.some(n => n.id === prev) ? prev : (list[0]?.id ?? null));
+    });
+    unLog = api.onLog(e => {
+      if (logIdRef.current !== e.id || !activeRef.current) return;
+      setLogEntries(current => [...current, { ts: e.ts, line: e.line }].slice(-500));
+    });
+    return () => { mounted = false; activeRef.current = false; unChanged(); unLog(); if (toastTimer.current) clearTimeout(toastTimer.current); };
+  }, [toast]);
+
+  useEffect(() => {
+    logIdRef.current = selectedId;
+    if (!selectedId) { setLogEntries([]); return; }
     let active = true;
-    api.logs(selectedId)
-      .then((entries) => {
-        if (active) setLogs(entries);
-      })
-      .catch(() => {
-        if (active) setLogs([]);
-      });
-    return () => {
-      active = false;
-    };
+    void api.logs(selectedId).then(data => { if (active) setLogEntries(data); }).catch(() => { if (active) setLogEntries([]); });
+    return () => { active = false; };
   }, [selectedId]);
 
-  const stats = useMemo(() => {
-    const running = nodes.filter((n) => n.status === "running").length;
-    const errored = nodes.filter((n) => n.status === "error").length;
-    return {
-      total: nodes.length,
-      running,
-      stopped: nodes.length - running - errored,
-      errored,
+  useEffect(() => {
+    const root = document.documentElement;
+    const apply = () => { const dark = theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches); root.dataset.theme = dark ? "dark" : "light"; };
+    apply();
+    localStorage.setItem("socksnode.theme.v3", theme);
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    query.addEventListener("change", apply);
+    return () => query.removeEventListener("change", apply);
+  }, [theme]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === ",") { e.preventDefault(); setPage("settings"); }
+      if (e.key === "Escape") { setConfirmDelete(null); setAdding(false); setEditorId(null); }
     };
-  }, [nodes]);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return nodes;
-    return nodes.filter(
-      (n) =>
-        n.name.toLowerCase().includes(q) ||
-        n.server.toLowerCase().includes(q) ||
-        String(n.localPort).includes(q),
-    );
-  }, [nodes, query]);
-
-  const selected = useMemo(
-    () => nodes.find((n) => n.id === selectedId) || null,
-    [nodes, selectedId],
-  );
-
-  const openCreate = () => {
-    setEditing(null);
-    const used = new Set(nodes.map((n) => n.localPort));
-    let port = 5001;
-    while (used.has(port)) port += 1;
-    setForm({ ...emptyForm, localPort: port });
-    setDialogOpen(true);
-  };
-
-  const openEdit = (node: ProxyNode) => {
-    setEditing(node);
-    setForm({
-      name: node.name,
-      type: node.type,
-      server: node.server,
-      port: node.port,
-      password: node.password,
-      udp: node.udp,
-      sni: node.sni,
-      skipCertVerify: node.skipCertVerify,
-      localPort: node.localPort,
-      enabled: node.enabled,
-      preferFastestIp: node.preferFastestIp !== false,
-      lanAccess: Boolean(node.lanAccess),
-    });
-    setDialogOpen(true);
-  };
-
-  const openSettings = async () => {
-    try {
-      setSettingsBusy(true);
-      setSettingsBusyLabel("读取设置…");
-      const s = await api.getSettings();
-      setSettings(s);
-      setCookieDraft("");
-      setHealthInterval(s.healthIntervalSecs);
-      setFailoverCooldown(s.failoverCooldownSecs);
-      setSelectStrategy(s.selectStrategy || "throughput");
-      setSpeedTopK(s.speedTopK || 3);
-      setSpeedTestMb(Math.max(0.25, (s.speedTestBytes || 1048576) / 1048576));
-      setLaunchAtLogin(Boolean(s.launchAtLogin));
-      setStartMinimized(Boolean(s.startMinimized));
-      setAutoStartNodes(Boolean(s.autoStartNodes));
-      setSettingsOpen(true);
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "读取设置失败", "danger");
-    } finally {
-      setSettingsBusy(false);
-      setSettingsBusyLabel("");
-    }
-  };
-
-  const saveSettings = async () => {
-    try {
-      setSettingsBusy(true);
-      setSettingsBusyLabel("保存设置…");
-      const patch: {
-        ilatencyCookie?: string;
-        healthIntervalSecs: number;
-        failoverCooldownSecs: number;
-        selectStrategy: string;
-        speedTopK: number;
-        speedTestBytes: number;
-        launchAtLogin: boolean;
-        startMinimized: boolean;
-        autoStartNodes: boolean;
-      } = {
-        healthIntervalSecs: healthInterval,
-        failoverCooldownSecs: failoverCooldown,
-        selectStrategy,
-        speedTopK,
-        speedTestBytes: Math.round(speedTestMb * 1048576),
-        launchAtLogin,
-        startMinimized: launchAtLogin && startMinimized,
-        autoStartNodes,
-      };
-      if (cookieDraft.trim()) {
-        patch.ilatencyCookie = cookieDraft.trim();
-      }
-      const s = await api.updateSettings(patch);
-      setSettings(s);
-      setCookieDraft("");
-      notify("设置已保存", "success");
-      setSettingsOpen(false);
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "保存设置失败", "danger");
-    } finally {
-      setSettingsBusy(false);
-      setSettingsBusyLabel("");
-    }
-  };
-
-  const testIlatency = async () => {
-    try {
-      setSettingsBusy(true);
-      setSettingsBusyLabel("验证 iLatency 会话…");
-      const candidate = cookieDraft.trim();
-      const user = await api.testIlatency(candidate || undefined);
-      notify(
-        candidate ? "验证成功：" + user + " · 点击保存以应用新 Cookie" : "iLatency 已登录：" + user,
-        "success",
-      );
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "iLatency 会话无效", "danger");
-    } finally {
-      setSettingsBusy(false);
-      setSettingsBusyLabel("");
-    }
-  };
-
-  const saveNode = async () => {
-    try {
-      await withGlobalBusy(editing ? "正在更新节点…" : "正在添加节点…", async () => {
-        if (editing) {
-          await api.update(editing.id, form);
-          notify("节点已更新", "success");
-        } else {
-          await api.create(form);
-          notify("节点已添加", "success");
-        }
-        setDialogOpen(false);
-        await refresh();
+  useEffect(() => {
+    if (page !== "routing") return;
+    const flow = document.getElementById("flow");
+    const src = document.getElementById("src");
+    const hub = document.getElementById("hub");
+    const ips = document.getElementById("ips");
+    if (!flow || !src || !hub || !ips) return;
+    const update = () => {
+      const base = flow.getBoundingClientRect();
+      const a = src.getBoundingClientRect();
+      const b = hub.getBoundingClientRect();
+      const p = (x: number, y: number) => [x - base.left, y - base.top];
+      const [x1,y1] = p(a.right, a.top + a.height / 2);
+      const [x2,y2] = p(b.left, b.top + b.height / 2);
+      const [x3,y3] = p(b.right, b.top + b.height / 2);
+      const paths = [{ d: "M" + x1 + " " + y1 + " C" + (x1 + 24) + " " + y1 + " " + (x2 - 24) + " " + y2 + " " + x2 + " " + y2, color: "var(--c1)", dashed: true }];
+      ips.querySelectorAll(".ipr").forEach((item, index) => {
+        const rect = item.getBoundingClientRect();
+        const [x4,y4] = p(rect.left, rect.top + rect.height / 2);
+        paths.push({ d: "M" + x3 + " " + y3 + " C" + (x3 + 24) + " " + y3 + " " + (x4 - 24) + " " + y4 + " " + x4 + " " + y4, color: index === 0 ? "var(--c1)" : "var(--line)", dashed: index === 0 });
       });
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "保存失败", "danger");
-    }
-  };
+      setWirePaths(paths);
+    };
+    const frame = requestAnimationFrame(update);
+    const observer = new ResizeObserver(update);
+    observer.observe(flow);
+    return () => { cancelAnimationFrame(frame); observer.disconnect(); };
+  }, [page, selectedId, nodes]);
 
-  const run = async (
-    id: string,
-    action: "start" | "stop" | "remove" | "test" | "reselect",
-  ) => {
-    const labels = {
-      start: "启动中（含 IP 优选/测速）…",
-      stop: "停止中…",
-      remove: "删除中…",
-      test: "测延迟中…",
-      reselect: "重新优选 IP 中…",
-    } as const;
+  const selected = nodes.find(n => n.id === selectedId) ?? null;
+  const running = nodes.filter(n => n.status === "running");
+  const errors = nodes.filter(n => n.status === "error");
+  const inProgress = !!busy;
+
+  const perform = async (title: string, fn: () => Promise<unknown>, success?: string): Promise<boolean> => {
+    if (inProgress) return false;
+    setBusy(title);
     try {
-      setBusyId(id);
-      setBusyAction(action);
-      setGlobalBusyLabel(labels[action]);
-      if (action === "start" || action === "test" || action === "stop") {
-        setSelectedId(id);
-        selectedIdRef.current = id;
-        try {
-          const existing = await api.logs(id);
-          if (selectedIdRef.current === id) setLogs(existing);
-        } catch {
-          if (selectedIdRef.current === id) setLogs([]);
-        }
-      }
-      await new Promise<void>((r) => requestAnimationFrame(() => r()));
-      if (action === "start") {
-        await api.start(id);
-        try {
-          const entries = await api.logs(id);
-          if (selectedIdRef.current === id) setLogs(entries);
-        } catch {
-          /* ignore */
-        }
-        const node = (await api.list()).find((n) => n.id === id);
-        if (node?.activeIp) {
-          notify(
-            `已启动 · 上游 ${node.activeIp}${
-              node.lastProbe?.ms != null ? ` · ${node.lastProbe.ms}ms` : ""
-            }`,
-            "success",
-          );
-        } else {
-          notify("本地 SOCKS 已启动", "success");
-        }
-        await refresh();
-      } else if (action === "stop") {
-        await api.stop(id);
-        notify("节点已停止", "success");
-        await refresh();
-      } else if (action === "test") {
-        const result = await api.test(id);
-        if (result.ok) {
-          notify(result.message, "success");
-        } else {
-          notify(result.message, "danger");
-        }
-        await refresh();
-      } else if (action === "reselect") {
-        await api.reselect(id);
-        try {
-          const entries = await api.logs(id);
-          if (selectedIdRef.current === id) setLogs(entries);
-        } catch {
-          /* ignore */
-        }
-        notify("已触发重新优选 IP", "success");
-        await refresh();
-      } else {
-        await api.remove(id);
-        notify("节点已删除", "success");
-        if (selectedId === id) setSelectedId(null);
-        await refresh();
-      }
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "操作失败", "danger");
-      try {
-        if (selectedIdRef.current === id) {
-          const entries = await api.logs(id);
-          if (selectedIdRef.current === id) setLogs(entries);
-        }
-      } catch {
-        /* ignore */
-      }
+      await fn();
       await refresh();
-    } finally {
-      setBusyId(null);
-      setBusyAction(null);
-      setGlobalBusyLabel("");
-    }
+      if (success) toast(success);
+      return true;
+    } catch (e) { toast(errMessage(e), "err"); try { await refresh(); } catch { /* retain view */ } return false; }
+    finally { setBusy(""); }
   };
 
-  const startAll = async () => {
-    try {
-      await withGlobalBusy("并行启动中…", async () => {
-        await api.startAll();
-        notify("全部节点已启动", "success");
-      });
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "批量启动失败", "danger");
-    }
+  const changePage = (next: Page) => { setPage(next); setAdding(false); setEditorId(null); };
+  const openAdd = () => {
+    setForm({ ...BASE_FORM, localPort: nextPort(nodes) }); setImportUrl(""); setAdding(true); setEditorId(null); setPage("upstreams");
+  };
+  const openEdit = (node: ProxyNode) => { setForm(toInput(node)); setEditorId(node.id); setAdding(false); setPage("upstreams"); };
+  const onField = <K extends keyof NodeInput>(key: K, value: NodeInput[K]) => setForm(old => ({ ...old, [key]: value }));
+
+  const saveNode = async (startAfter = false) => {
+    if (!form.name.trim() || !form.server.trim() || !form.password.trim()) { toast("请填写名称、服务器和密码", "warn"); return; }
+    if (!Number.isInteger(form.port) || form.port < 1 || form.port > 65535 || !Number.isInteger(form.localPort) || form.localPort < 1 || form.localPort > 65535) { toast("端口应在 1–65535 之间", "warn"); return; }
+    const edit = editorId;
+    await perform(edit ? "正在更新节点…" : "正在创建节点…", async () => {
+      const before = nodes.map(n => n.id);
+      if (edit) await api.update(edit, form);
+      else await api.create(form);
+      setAdding(false); setEditorId(null);
+      if (startAfter) {
+        const now = await api.list();
+        const created = now.find(n => !before.includes(n.id));
+        if (created) { setSelectedId(created.id); await api.start(created.id); setPage("nodes"); }
+      }
+    }, edit ? "节点已更新" : "节点已添加");
   };
 
-  const stopAll = async () => {
-    try {
-      await withGlobalBusy("并行停止中…", async () => {
-        await api.stopAll();
-        notify("全部节点已停止", "success");
-      });
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "批量停止失败", "danger");
-    }
+  const applySettings = async (patch: AppSettingsPatch): Promise<boolean> => {
+    return perform("正在保存设置…", async () => {
+      const result = await api.updateSettings(patch);
+      setSettings(result);
+    }, "设置已保存");
+  };
+  const testIlatency = async () => {
+    await perform("正在验证 iLatency…", async () => {
+      const user = await api.testIlatency(cookieDraft.trim() || undefined);
+      toast(cookieDraft.trim() ? "认证有效：" + user + "，请点击保存 Cookie" : "认证有效：" + user);
+    });
+  };
+  const copy = async (value: string, success = "已复制") => {
+    try { await navigator.clipboard.writeText(value); toast(success); }
+    catch { toast("无法复制到剪贴板", "err"); }
+  };
+  const nodeAction = (node: ProxyNode, action: "start" | "stop" | "test" | "reselect") => {
+    setSelectedId(node.id);
+    if (action === "start") void perform("正在启动 " + node.name + "…", () => api.start(node.id), node.name + " 已启动");
+    if (action === "stop") void perform("正在停止 " + node.name + "…", () => api.stop(node.id), node.name + " 已停止");
+    if (action === "test") void perform("正在测试 " + node.name + "…", async () => {
+      const result = await api.test(node.id);
+      if (!result.ok) throw new Error(result.message);
+      toast(node.name + " · " + result.ms + " ms");
+    });
+    if (action === "reselect") void perform("正在重新优选 IP…", () => api.reselect(node.id), "IP 优选已完成");
+  };
+  const allAction = (action: "start" | "stop" | "test") => {
+    if (action === "start") void perform("正在批量启动…", () => api.startAll(), "批量启动完成");
+    if (action === "stop") void perform("正在批量停止…", () => api.stopAll(), "全部停止");
+    if (action === "test") void perform("正在逐个测延迟…", async () => {
+      const candidates = nodes.filter(n => n.status === "running");
+      if (!candidates.length) throw new Error("目前没有运行中的节点");
+      let success = 0;
+      for (const node of candidates) { try { const result = await api.test(node.id); if (result.ok) success++; } catch { /* continue */ } }
+      toast("延迟测试：" + success + "/" + candidates.length + " 成功", success === candidates.length ? "ok" : "warn");
+    });
   };
 
-  const anyBusy =
-    globalBusy ||
-    !!busyId ||
-    refreshing ||
-    settingsBusy ||
-    nodes.some((n) => n.status === "starting" || n.status === "stopping");
-  const busyLabel =
-    globalBusyLabel ||
-    settingsBusyLabel ||
-    (refreshing
-      ? "刷新中…"
-      : busyId
-        ? busyAction === "start"
-          ? "节点启动/优选中…"
-          : busyAction === "stop"
-            ? "节点停止中…"
-            : busyAction === "test"
-              ? "测延迟中…"
-              : busyAction === "reselect"
-                ? "重新优选 IP 中…"
-                : "处理中…"
-        : nodes.some((n) => n.status === "starting")
-          ? "节点启动中…"
-          : nodes.some((n) => n.status === "stopping")
-            ? "节点停止中…"
-            : "处理中…");
-
-  // Prefer live busy text; otherwise show the last success/error flash.
-  const toolbarStatus = anyBusy
-    ? { text: busyLabel, tone: "info" as const, busy: true }
-    : flash
-      ? { text: flash.text, tone: flash.tone, busy: false }
-      : null;
-
-  const copyText = async (text: string, label = "已复制") => {
-    try {
-      await navigator.clipboard.writeText(text);
-      notify(label, "success");
-    } catch {
-      notify("复制失败", "danger");
-    }
-  };
-
-  const startDragging = (e: React.MouseEvent) => {
-    if (e.button !== 0) return;
-    const el = e.target as HTMLElement;
-    if (el.closest("button, a, input, textarea, select, [role=button]")) return;
-    e.preventDefault();
-    void getCurrentWindow().startDragging();
-  };
-
-  const onTitleDoubleClick = (e: React.MouseEvent) => {
-    if ((e.target as HTMLElement).closest("button, a, input")) return;
-    void getCurrentWindow().toggleMaximize();
-  };
-
-  const nodeBusy = selected
-    ? busyId === selected.id ||
-      selected.status === "starting" ||
-      selected.status === "stopping"
-    : false;
-
-  return (
-    <div className="flex h-full flex-col overflow-hidden bg-background">
-      {/* Custom title bar + self-drawn traffic lights (decorations: false) */}
-      <header className="flex h-12 shrink-0 items-center border-b border-border/60">
-        <WindowControls />
-        <div
-          data-tauri-drag-region
-          className="app-drag flex h-full min-w-0 flex-1 items-center gap-3"
-          onMouseDown={startDragging}
-          onDoubleClick={onTitleDoubleClick}
-        >
-          <span className="text-sm font-semibold leading-none tracking-tight">
-            SocksNode
-          </span>
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-secondary/55 px-2 py-0.5 text-[11px] text-muted-foreground">
-            <span
-              className={cn(
-                "size-1.5 rounded-full",
-                stats.running > 0 ? "bg-success" : "bg-muted-foreground/40",
-              )}
-            />
-            <span className="tabular-nums">
-              {stats.running}/{stats.total}
-            </span>
-            运行
-            {stats.errored > 0 ? (
-              <span className="text-destructive">· {stats.errored} 异常</span>
-            ) : null}
-          </span>
+  const NodeRow = ({ node }: { node: ProxyNode }) => {
+    const transitional = node.status === "starting" || node.status === "stopping";
+    const active = node.status === "running";
+    return <div className={cn("row", !node.enabled && "off")}>
+      <span className="ic">{flag(node.name)}</span>
+      <div className="who">
+        <div className="name">{node.name}</div>
+        <div className={cn("sub", node.status === "error" && "err")}>
+          <span className={cn("dot", dotClass(node.status))} />
+          {node.status === "error" ? <>启动失败 · {node.lastError || "未知错误"}</> :
+            transitional ? (node.status === "starting" ? "启动中 · 解析与优选…" : "停止中…") :
+            active ? <>已监听 · <span className="mono">127.0.0.1:{node.localPort}</span> {node.lanAccess && " · 局域网可用"} {runtimeLatency(node) != null && <span className={latClass(runtimeLatency(node))}> · {runtimeLatency(node)} ms</span>}</> :
+            <>已停止 · 打开后监听 <span className="mono">:{node.localPort}</span>{!node.enabled && " · 不参与批量启动"}</>}
         </div>
-        <div className="app-no-drag flex h-full min-w-0 items-center gap-1.5 pr-3">
-          {toolbarStatus ? (
-            <div
-              className={cn(
-                "mr-1 flex min-w-0 max-w-[min(360px,36vw)] items-center gap-1.5 text-[11px]",
-                toolbarStatus.tone === "success" && "text-success",
-                toolbarStatus.tone === "danger" && "text-destructive",
-                toolbarStatus.tone === "info" && "text-muted-foreground",
-                toolbarStatus.tone === "muted" && "text-muted-foreground",
-              )}
-              title={toolbarStatus.text}
-            >
-              {toolbarStatus.busy ? <Spinner size="xs" /> : null}
-              <span className="truncate">{toolbarStatus.text}</span>
-            </div>
-          ) : null}
-          <Button
-            variant="secondary"
-            size="sm"
-            className="text-muted-foreground"
-            loading={globalBusy && globalBusyLabel.includes("停止")}
-            disabled={globalBusy || stats.total === 0}
-            onClick={stopAll}
-          >
-            <Square className="size-3" strokeWidth={1.7} />
-            全部停止
-          </Button>
-          <Button
-            size="sm"
-            loading={globalBusy && globalBusyLabel.includes("启动")}
-            disabled={globalBusy || stats.total === 0}
-            onClick={startAll}
-          >
-            <Play className="size-3" strokeWidth={1.7} />
-            全部启动
-          </Button>
-          <div className="mx-0.5 h-4 w-px bg-border" />
-          {info ? (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="数据目录"
-              disabled={anyBusy}
-              onClick={() => api.openPath(info.dataDir)}
-            >
-              <FolderOpen className="size-3.5" strokeWidth={1.7} />
-            </Button>
-          ) : null}
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="设置"
-            loading={settingsBusy && !settingsOpen}
-            onClick={openSettings}
-          >
-            {!settingsBusy || settingsOpen ? (
-              <Settings className="size-3.5" strokeWidth={1.7} />
-            ) : null}
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="切换主题"
-            onClick={() => setDark(!dark)}
-          >
-            {dark ? (
-              <Sun className="size-3.5" strokeWidth={1.7} />
-            ) : (
-              <Moon className="size-3.5" strokeWidth={1.7} />
-            )}
-          </Button>
-        </div>
-      </header>
-
-      {/* Workspace: node rail + detail/logs */}
-      <div className="flex min-h-0 flex-1">
-        {/* Left: node list (primary proxy client surface) */}
-        <aside className="flex w-[300px] shrink-0 flex-col border-r border-border/60 bg-sidebar">
-          <div className="flex shrink-0 items-center gap-1.5 border-b border-border/60 px-2.5 py-2">
-            <Input
-              className="h-7 bg-background/60"
-              placeholder="搜索节点…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              loading={refreshing}
-              onClick={refresh}
-              aria-label="刷新"
-            >
-              {!refreshing ? (
-                <RefreshCw className="size-3.5" strokeWidth={1.7} />
-              ) : null}
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              disabled={globalBusy}
-              onClick={openCreate}
-              aria-label="添加节点"
-            >
-              <Plus className="size-3.5" strokeWidth={1.7} />
-            </Button>
-          </div>
-
-          <div className="min-h-0 flex-1 basis-0 overflow-y-auto py-1">
-            {loading ? (
-              <div className="space-y-1 px-2 py-2">
-                {Array.from({ length: 4 }).map((_, i) => (
-                  <div
-                    key={i}
-                    className="h-12 animate-pulse rounded-md bg-secondary/60"
-                  />
-                ))}
-              </div>
-            ) : filtered.length === 0 ? (
-              <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
-                <p className="text-xs text-muted-foreground">
-                  {nodes.length === 0 ? "还没有节点" : "无匹配结果"}
-                </p>
-                {nodes.length === 0 ? (
-                  <Button size="sm" onClick={openCreate}>
-                    <Plus className="size-3" strokeWidth={1.7} />
-                    添加节点
-                  </Button>
-                ) : null}
-              </div>
-            ) : (
-              filtered.map((node) => {
-                const active = selectedId === node.id;
-                const latency =
-                  node.lastProbe?.ms ?? node.lastTest?.ms ?? null;
-                return (
-                  <button
-                    key={node.id}
-                    type="button"
-                    onClick={() => {
-                      selectedIdRef.current = node.id;
-                      setSelectedId(node.id);
-                    }}
-                    className={cn(
-                      "flex w-full items-start gap-2.5 px-3 py-2.5 text-left transition-colors",
-                      "hover:bg-secondary/50",
-                      active && "bg-secondary/70",
-                    )}
-                  >
-                    <StatusDot status={node.status} />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="truncate text-xs font-medium">
-                          {node.name}
-                        </span>
-                        <span
-                          className={cn(
-                            "shrink-0 tabular-nums text-[11px]",
-                            latency != null
-                              ? "text-muted-foreground"
-                              : "text-muted-foreground/50",
-                          )}
-                        >
-                          {latency != null ? `${latency}ms` : "—"}
-                        </span>
-                      </div>
-                      <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                        <span className="font-mono tabular-nums">
-                          :{node.localPort}
-                        </span>
-                        <span className="opacity-40">·</span>
-                        <span className="truncate">{node.type}</span>
-                        {node.status === "starting" ||
-                        node.status === "stopping" ||
-                        busyId === node.id ? (
-                          <Spinner size="xs" className="ml-auto" />
-                        ) : null}
-                      </div>
-                      {node.lastError ? (
-                        <div className="mt-0.5 truncate text-[10px] text-destructive">
-                          {node.lastError}
-                        </div>
-                      ) : null}
-                    </div>
-                  </button>
-                );
-              })
-            )}
-          </div>
-
-          <div className="flex shrink-0 items-center justify-between gap-2 border-t border-border/60 px-3 py-2 text-[11px] text-muted-foreground">
-            <span className="tabular-nums">
-              {filtered.length}
-              {query ? ` / ${nodes.length}` : ""} 节点
-            </span>
-            {info ? (
-              <span className="truncate tabular-nums">v{info.version}</span>
-            ) : null}
-          </div>
-        </aside>
-
-        {/* Right: selected node + logs */}
-        <section className="flex min-w-0 flex-1 flex-col">
-          {!selected ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
-              <Terminal
-                className="size-5 text-muted-foreground/50"
-                strokeWidth={1.6}
-              />
-              <p className="text-xs text-muted-foreground">
-                从左侧选择节点，或添加新节点
-              </p>
-            </div>
-          ) : (
-            <>
-              {/* Node inspector */}
-              <div className="shrink-0 border-b border-border/60 px-4 py-3">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h2 className="truncate text-sm font-medium">
-                        {selected.name}
-                      </h2>
-                      <Badge tone={statusTone(selected.status)}>
-                        {(selected.status === "starting" ||
-                          selected.status === "stopping" ||
-                          busyId === selected.id) && <Spinner size="xs" />}
-                        {statusLabel(selected.status)}
-                      </Badge>
-                    </div>
-                    <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
-                      {selected.server}:{selected.port}
-                      <span className="mx-1 opacity-40">·</span>
-                      {selected.type}
-                      {selected.sni ? (
-                        <>
-                          <span className="mx-1 opacity-40">·</span>
-                          sni {selected.sni}
-                        </>
-                      ) : null}
-                    </p>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    {selected.status === "running" ? (
-                      <>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          loading={
-                            busyId === selected.id && busyAction === "test"
-                          }
-                          disabled={nodeBusy || globalBusy}
-                          onClick={() => run(selected.id, "test")}
-                        >
-                          {!(
-                            busyId === selected.id && busyAction === "test"
-                          ) ? (
-                            <Activity className="size-3" strokeWidth={1.7} />
-                          ) : null}
-                          延迟
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          title="重新走 DNS → tcping → 测速，选出的 IP 不同则自动重启"
-                          loading={
-                            busyId === selected.id && busyAction === "reselect"
-                          }
-                          disabled={
-                            nodeBusy || globalBusy || !selected.preferFastestIp
-                          }
-                          onClick={() => run(selected.id, "reselect")}
-                        >
-                          {!(
-                            busyId === selected.id &&
-                            busyAction === "reselect"
-                          ) ? (
-                            <RefreshCw className="size-3" strokeWidth={1.7} />
-                          ) : null}
-                          重选 IP
-                        </Button>
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          className="text-muted-foreground"
-                          loading={
-                            busyId === selected.id && busyAction === "stop"
-                          }
-                          disabled={nodeBusy || globalBusy}
-                          onClick={() => run(selected.id, "stop")}
-                        >
-                          {!(
-                            busyId === selected.id && busyAction === "stop"
-                          ) ? (
-                            <Square className="size-3" strokeWidth={1.7} />
-                          ) : null}
-                          停止
-                        </Button>
-                      </>
-                    ) : (
-                      <Button
-                        size="sm"
-                        loading={
-                          (busyId === selected.id &&
-                            busyAction === "start") ||
-                          selected.status === "starting"
-                        }
-                        disabled={nodeBusy || globalBusy}
-                        onClick={() => run(selected.id, "start")}
-                      >
-                        {!(
-                          busyId === selected.id && busyAction === "start"
-                        ) ? (
-                          <Play className="size-3" strokeWidth={1.7} />
-                        ) : null}
-                        启动
-                      </Button>
-                    )}
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="编辑"
-                      disabled={nodeBusy || globalBusy}
-                      onClick={() => openEdit(selected)}
-                    >
-                      <Pencil className="size-3.5" strokeWidth={1.7} />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="删除"
-                      loading={
-                        busyId === selected.id && busyAction === "remove"
-                      }
-                      disabled={nodeBusy || globalBusy}
-                      onClick={() => run(selected.id, "remove")}
-                    >
-                      {!(
-                        busyId === selected.id && busyAction === "remove"
-                      ) ? (
-                        <Trash2 className="size-3.5" strokeWidth={1.7} />
-                      ) : null}
-                    </Button>
-                  </div>
-                </div>
-
-                {/* Endpoints strip */}
-                <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                  <EndpointChip
-                    label="本机 SOCKS"
-                    value={`127.0.0.1:${selected.localPort}`}
-                    mono={selected.socks}
-                    onCopy={() => copyText(selected.socks, "本机 SOCKS 已复制")}
-                  />
-                  {selected.lanAccess ? (
-                    <EndpointChip
-                      label="局域网"
-                      value={
-                        selected.lanSocks
-                          ? selected.lanSocks.replace("socks5://", "")
-                          : `0.0.0.0:${selected.localPort}`
-                      }
-                      mono={selected.lanSocks || undefined}
-                      onCopy={
-                        selected.lanSocks
-                          ? () =>
-                              copyText(selected.lanSocks!, "局域网 SOCKS 已复制")
-                          : undefined
-                      }
-                    />
-                  ) : (
-                    <div className="rounded-md bg-secondary/40 px-2.5 py-2 text-[11px] text-muted-foreground">
-                      局域网接入未开启
-                    </div>
-                  )}
-                </div>
-
-                {/* Live status line */}
-                <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-                  {selected.activeIp ? (
-                    <span className="font-mono">
-                      → {selected.activeIp}
-                      {selected.lastProbe?.ms != null
-                        ? ` · ${selected.lastProbe.ms}ms`
-                        : ""}
-                    </span>
-                  ) : (
-                    <span>上游 IP 未选定</span>
-                  )}
-                  {selected.lastTest?.ok ? (
-                    <span className="text-success tabular-nums">
-                      延迟 {selected.lastTest.ms}ms
-                    </span>
-                  ) : selected.lastTest && !selected.lastTest.ok ? (
-                    <span className="text-destructive">
-                      延迟失败 · {selected.lastTest.message}
-                    </span>
-                  ) : selected.status === "running" ? (
-                    <span>点「延迟」测 simple RTT</span>
-                  ) : null}
-                  {selected.pid ? (
-                    <span className="tabular-nums">pid {selected.pid}</span>
-                  ) : null}
-                  <span>
-                    UDP {selected.udp ? "on" : "off"}
-                    {" · "}
-                    优选 {selected.preferFastestIp !== false ? "on" : "off"}
-                  </span>
-                </div>
-              </div>
-
-              {/* Logs fill remaining height */}
-              <div className="flex min-h-0 flex-1 basis-0 flex-col">
-                <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border/50 px-4 py-1.5">
-                  <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                    <Terminal className="size-3" strokeWidth={1.7} />
-                    <span>运行日志</span>
-                    <span className="tabular-nums opacity-70">
-                      {logs.length}
-                    </span>
-                  </div>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-6 px-2"
-                    onClick={async () => {
-                      if (!selectedId) return;
-                      const id = selectedId;
-                      try {
-                        const entries = await api.logs(id);
-                        if (selectedIdRef.current === id) setLogs(entries);
-                      } catch {
-                        if (selectedIdRef.current === id) setLogs([]);
-                      }
-                    }}
-                  >
-                    <RefreshCw className="size-3" strokeWidth={1.7} />
-                    刷新
-                  </Button>
-                </div>
-                <div className="allow-select min-h-0 flex-1 basis-0 overflow-auto bg-card/40 px-4 py-2 font-mono text-[11px] leading-5 text-muted-foreground">
-                  {logs.length === 0 ? (
-                    <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
-                      <p>暂无日志</p>
-                      <p className="text-[10px] opacity-70">
-                        启动后 DNS / tcping / 测速输出会出现在这里
-                      </p>
-                    </div>
-                  ) : (
-                    <>
-                      {logs.map((log, idx) => (
-                        <div
-                          key={`${log.ts}-${idx}`}
-                          className="whitespace-pre-wrap break-all"
-                        >
-                          <span className="text-foreground/35">
-                            {new Date(log.ts).toLocaleTimeString()}
-                          </span>{" "}
-                          {log.line}
-                        </div>
-                      ))}
-                      <div ref={logEndRef} />
-                    </>
-                  )}
-                </div>
-              </div>
-            </>
-          )}
-        </section>
       </div>
+      {node.preferFastestIp && <button className="count" onClick={() => { setSelectedId(node.id); changePage("routing"); }}>优选详情 <ChevronRight size={13} /></button>}
+      <div className="fields"><button className="field" onClick={() => { setSelectedId(node.id); changePage("routing"); }} title="查看此节点的 IP 优选状态">
+        <span className={cn("v", "mono", !node.activeIp && "dim")}>{active ? (node.activeIp || node.server) : (node.preferFastestIp ? "启动时优选" : "固定解析")}</span><span className="chev"><ChevronDown size={12} /></span>
+      </button></div>
+      <Toggle checked={active} label={active ? "停止 " + node.name : "启动 " + node.name} busy={transitional} disabled={inProgress} onClick={() => nodeAction(node, active ? "stop" : "start")} />
+    </div>;
+  };
 
-      <Dialog
-        open={dialogOpen}
-        onClose={() => setDialogOpen(false)}
-        title={editing ? "编辑节点" : "添加节点"}
-        description="上游 anytls 等协议 → 本地 SOCKS5。"
-        busy={globalBusy && globalBusyLabel.includes("节点")}
-        footer={
-          <>
-            <Button
-              variant="secondary"
-              disabled={globalBusy}
-              onClick={() => setDialogOpen(false)}
-            >
-              取消
-            </Button>
-            <Button
-              loading={globalBusy && globalBusyLabel.includes("节点")}
-              onClick={saveNode}
-            >
-              保存
-            </Button>
-          </>
-        }
-      >
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="名称">
-            <Input
-              value={form.name}
-              onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-              placeholder="例如 香港 01"
-            />
-          </Field>
-          <Field label="协议类型">
-            <Input value="anytls" readOnly aria-readonly />
-          </Field>
-          <Field label="服务器">
-            <Input
-              value={form.server}
-              onChange={(e) => setForm((f) => ({ ...f, server: e.target.value }))}
-              placeholder="host or ip"
-            />
-          </Field>
-          <Field label="远程端口">
-            <Input
-              type="number"
-              value={form.port}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, port: Number(e.target.value) }))
-              }
-            />
-          </Field>
-          <Field label="密码">
-            <Input
-              type="password"
-              autoComplete="off"
-              value={form.password}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, password: e.target.value }))
-              }
-            />
-          </Field>
-          <Field label="本地 SOCKS 端口">
-            <Input
-              type="number"
-              value={form.localPort}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, localPort: Number(e.target.value) }))
-              }
-            />
-          </Field>
-          <Field label="SNI">
-            <Input
-              value={form.sni || ""}
-              onChange={(e) => setForm((f) => ({ ...f, sni: e.target.value }))}
-            />
-          </Field>
-          <div className="flex flex-col justify-end gap-2 pb-1">
-            <Checkbox
-              id="enabled"
-              label="参与全部启动和开机自动启动"
-              checked={form.enabled !== false}
-              onCheckedChange={(v) => setForm((f) => ({ ...f, enabled: v }))}
-            />
-            <Checkbox
-              id="udp"
-              label="启用 UDP"
-              checked={form.udp !== false}
-              onCheckedChange={(v) => setForm((f) => ({ ...f, udp: v }))}
-            />
-            <Checkbox
-              id="skip"
-              label="跳过证书验证"
-              checked={Boolean(form.skipCertVerify)}
-              onCheckedChange={(v) =>
-                setForm((f) => ({ ...f, skipCertVerify: v }))
-              }
-            />
-            <Checkbox
-              id="prefer"
-              label="优选最快 IP（多地 DNS + tcping）"
-              checked={form.preferFastestIp !== false}
-              onCheckedChange={(v) =>
-                setForm((f) => ({ ...f, preferFastestIp: v }))
-              }
-            />
-            <Checkbox
-              id="lan"
-              label="允许局域网连入（0.0.0.0）"
-              checked={Boolean(form.lanAccess)}
-              onCheckedChange={(v) =>
-                setForm((f) => ({ ...f, lanAccess: v }))
-              }
-            />
-            {form.lanAccess ? (
-              <p className="pl-6 text-[10px] leading-4 text-amber-700 dark:text-amber-400">
-                注意：局域网内任何人都能使用该 SOCKS5，且内核不支持认证。
-                请仅在可信网络中开启。
-              </p>
-            ) : null}
+  const renderNodes = () => {
+    if (loading) return <div className="list">{[1,2,3,4,5].map(i => <div className="row" key={i}><span className="sk" style={{ width: 22, height: 22 }} /><div className="who"><span className="sk" style={{ width: 130, height: 12 }} /><span className="sk" style={{ width: 240, height: 9, marginTop: 7 }} /></div></div>)}</div>;
+    if (!nodes.length) return <Empty title="还没有节点">前往「上游」添加 AnyTLS 节点后，即可创建本机 SOCKS5 端口。<br/><TextBtn kind="primary" onClick={openAdd}><Plus size={13}/> 添加节点</TextBtn></Empty>;
+    const main = nodes.filter(n => n.enabled), rest = nodes.filter(n => !n.enabled);
+    return <><p className="lede">打开开关，节点就会把上游 anytls 转成一个本机 SOCKS5 端口；<b>已监听</b>只代表端口就绪，真实连通请看延迟。所有状态与 IP 均来自运行中的客户端。</p>
+      <div className="list">{main.map(n => <NodeRow key={n.id} node={n}/>)}
+        {rest.length > 0 && (folded ? <button className="more-row" onClick={() => setFolded(false)}>显示其余 {rest.length} 个（不参与全部启动） <ChevronDown size={12}/></button> : <>{rest.map(n => <NodeRow key={n.id} node={n}/>)}<button className="more-row" onClick={() => setFolded(true)}>收起</button></>)}
+      </div>
+      <section className="profiles"><span className="label">批量</span><div className="chips">
+        <button className="chip" disabled={inProgress} onClick={() => allAction("start")}><span className="lib"/>全部启动</button>
+        <button className="chip" disabled={inProgress} onClick={() => allAction("stop")}>全部停止</button>
+        <button className="chip" disabled={inProgress} onClick={() => allAction("test")}>全部测延迟</button>
+      </div><span className="grow"/><TextBtn onClick={openAdd}><Plus size={13}/> 添加节点</TextBtn></section></>;
+  };
+
+  const renderEditor = (isNew: boolean) => {
+    const check = (key: keyof NodeInput, label: string) => <button type="button" key={key} className={cn("ck", Boolean(form[key]) && "on")} onClick={() => onField(key, !form[key] as never)}><i />{label}</button>;
+    return <div className="editor">
+      {!isNew && <div className="ehead"><span className="ic">{flag(form.name)}</span><b>{form.name}</b><span className="note">anytls · 修改运行中的节点会自动重启</span></div>}
+      <Field label="名称"><input className="inp" value={form.name} placeholder="例如 香港 01" onChange={e => onField("name", e.target.value)} /></Field>
+      <Field label="服务器"><div className="pair"><input className="inp mono" value={form.server} placeholder="域名或 IP" onChange={e => onField("server", e.target.value)} /><input className="inp mono" type="number" min="1" max="65535" aria-label="远程端口" value={form.port} onChange={e => onField("port", Number(e.target.value))}/></div></Field>
+      <Field label="密码"><input className="inp mono" type="password" autoComplete="off" value={form.password} onChange={e => onField("password", e.target.value)}/></Field>
+      <Field label="SNI"><input className="inp mono" value={form.sni ?? ""} onChange={e => onField("sni", e.target.value)}/></Field>
+      <Field label="本机端口"><div><input className="inp mono" style={{ width: 115 }} type="number" min="1" max="65535" value={form.localPort} onChange={e => onField("localPort", Number(e.target.value))}/><div className="hint">127.0.0.1 监听；局域网连入时为 0.0.0.0</div></div></Field>
+      <Field label="选项"><div><div className="checks">{check("udp", "UDP over TCP")}{check("preferFastestIp", "启动时优选 IP")}{check("skipCertVerify", "跳过证书验证")}{check("enabled", "参与全部启动")}{check("lanAccess", "局域网连入")}</div>
+        {form.lanAccess && <div className="hint warn">局域网代理没有认证，同一网络中的其他设备可能使用它。</div>}
+        {form.skipCertVerify && <div className="hint warn">已关闭上游 TLS 证书验证，请仅在可信任的节点上使用。</div>}
+      </div></Field>
+      <div className="efoot">
+        {!isNew && <><TextBtn kind="danger" disabled={inProgress} onClick={() => setConfirmDelete(editorId)}>删除节点</TextBtn>
+        <TextBtn onClick={() => { const n = nodes.find(n => n.id === editorId); if (n) void copy(anytlsLink(n), "包含密码的节点链接已复制"); }}>复制为 anytls:// 链接</TextBtn></>}
+        <span className="grow" />
+        <TextBtn kind="action" onClick={() => { setAdding(false); setEditorId(null); }}>取消</TextBtn>
+        {isNew && <TextBtn kind="action" disabled={inProgress} onClick={() => void saveNode(true)}>保存并启动</TextBtn>}
+        <TextBtn kind="primary" disabled={inProgress} onClick={() => void saveNode(false)}>保存</TextBtn>
+      </div>
+    </div>;
+  };
+
+  const renderAdd = () => <div>
+    <div className="sheet-head"><b>添加节点</b><span className="grow"/><TextBtn onClick={() => setAdding(false)}>关闭 <X size={13}/></TextBtn></div>
+    <RowHead label="链接 · 粘贴 AnyTLS URI 自动填写下面的表单"/>
+    <div className="uri-card"><Copy size={14} style={{ color: "var(--faint)" }}/><input type="text" value={importUrl} onChange={e => setImportUrl(e.target.value)} placeholder="anytls://密码@主机:端口?sni=www.icloud.com#香港01"/>
+      <TextBtn onClick={() => { try { setForm(current => ({ ...current, ...readAnytlsLink(importUrl) })); toast("节点信息已解析，请检查后保存"); } catch(e) { toast(errMessage(e), "err"); } }}>解析</TextBtn>
+      <TextBtn onClick={() => void navigator.clipboard.readText().then(value => { setImportUrl(value); setForm(current => ({ ...current, ...readAnytlsLink(value) })); toast("已从剪贴板导入"); }).catch(e => toast(errMessage(e), "err"))}>从剪贴板</TextBtn>
+    </div>
+    <RowHead label="SNI 预设 · 上游没有指定时使用"/>
+    <div className="grid">{SNI_PRESETS.map(sni => <button className={cn("pcard", form.sni === sni && "on")} key={sni} onClick={() => onField("sni", sni)}><span className="ic">🔒</span><span className="who"><span className="name mono">{sni}</span><span className="sub">TLS Server Name</span></span></button>)}</div>
+    <RowHead label="手动填写"/>
+    <div className="list">{renderEditor(true)}</div>
+    <div style={{ height: 16 }} />
+  </div>;
+
+  const renderUpstreams = () => {
+    if (adding) return renderAdd();
+    if (!nodes.length) return <Empty title="还没有上游">手动填写服务器信息，或粘贴 anytls:// 链接。<br/><TextBtn kind="primary" onClick={openAdd}><Plus size={13}/> 添加节点</TextBtn></Empty>;
+    return <><div className="list" style={{ marginTop: 7 }}>{nodes.map(n => <div key={n.id}>
+      <div className="row">
+        <span className="ic">{flag(n.name)}</span>
+        <div className="who"><div className="name">{n.name}</div><div className="sub"><span className="mono">{n.server}:{n.port}</span> · SNI {n.sni}</div></div>
+        <div className="agent-chips">{n.udp && <span>UDP</span>}{n.preferFastestIp && <span>优选</span>}{n.lanAccess && <span>局域网</span>}</div>
+        <span className="secret" style={{ marginLeft: 12 }}><span className={cn("dot", dotClass(n.status))}/>••••••</span>
+        <button className="icon" title={editorId === n.id ? "关闭编辑" : "编辑节点"} aria-label={"编辑 " + n.name} onClick={() => editorId === n.id ? setEditorId(null) : openEdit(n)}>
+          <ChevronRight size={15} style={{ transform: editorId === n.id ? "rotate(90deg)" : "", transition: "transform .15s" }}/></button>
+      </div>
+      {editorId === n.id && renderEditor(false)}
+    </div>)}</div>
+    <div className="after-list"><TextBtn onClick={openAdd}><Plus size={13}/> 添加节点</TextBtn><span className="grow"/><span className="note">修改节点会立即保存到本地配置</span></div></>;
+  };
+
+  const renderGateway = () => {
+    if (!selected) return <Empty title="没有可用的 SOCKS 端口">添加节点后，这里会显示本机代理地址和连接方法。</Empty>;
+    const address = "127.0.0.1:" + selected.localPort;
+    const proxy = "socks5h://" + address;
+    const commands: [string, string][] = [
+      ["终端", "export ALL_PROXY=" + proxy],
+      ["curl", "curl -x " + proxy + " https://cp.cloudflare.com"],
+      ["浏览器", "SOCKS5 主机：127.0.0.1    端口：" + selected.localPort],
+    ];
+    return <><div className="list" style={{ marginTop: 7 }}>
+      <div className="row gw"><span className="ic" style={{ width: 28 }}><Network size={21}/></span><div className="who"><div className="big">127.0.0.1 <span style={{ color: "var(--muted)", fontWeight: 400 }}>:{selected.localPort}</span></div><div className="sub"><span className={cn("dot", dotClass(selected.status))}/>{running.length} 个端口在监听 · SOCKS5 · 不改系统代理，不开 TUN</div></div></div></div>
+      <RowHead label="接入" right={<select className="field" aria-label="选择网关节点" value={selected.id} onChange={e => setSelectedId(e.target.value)}>{nodes.map(n => <option key={n.id} value={n.id}>{n.name} · :{n.localPort}</option>)}</select>}/>
+      <div className="list">{commands.map(([title, value]) => <div key={title} className="row cn"><span className="k">{title}</span><div className="codebox">{value}</div><button className="copy" title={"复制 " + title} onClick={() => void copy(value)}><Copy size={14}/></button></div>)}
+        <div className="row cn"><span className="k">局域网</span><div className="codebox">{selected.lanAccess ? selected.lanSocks || "已开启局域网监听，当前没有可用的局域网地址" : "未开放 · 默认仅本机可用"}</div>{selected.lanSocks && <button className="copy" title="复制局域网地址" onClick={() => void copy(selected.lanSocks!)}><Copy size={14}/></button>}</div>
+        <div className="row"><span className="ic"><span className={cn("dot", dotClass(selected.status))}/></span><div className="who"><div className="name">{selected.name}</div><div className="sub">AnyTLS · {selected.server}:{selected.port} · 监听 :{selected.localPort}</div></div><TextBtn kind="action" disabled={inProgress} onClick={() => nodeAction(selected, "test")}>测延迟</TextBtn></div>
+      </div>
+      <RowHead label="其他本机端口"/>
+      <div className="list">{nodes.map(n => <div className="row" key={n.id}><span className="ic">{flag(n.name)}</span><div className="who"><div className="name">{n.name}</div><div className="sub"><span className={cn("dot", dotClass(n.status))}/><span className="mono">{n.socks}</span></div></div><button className="copy" title="复制 SOCKS 地址" onClick={() => void copy(n.socks)}><Copy size={14}/></button></div>)}</div>
+    </>;
+  };
+
+  const renderRouting = () => {
+    const candidates = nodes.filter(n => n.preferFastestIp);
+    const node = selected && selected.preferFastestIp ? selected : candidates[0];
+    if (!node) return <Empty title="尚无启用 IP 优选的节点">在「上游」编辑节点并开启「启动时优选 IP」。</Empty>;
+    const value = node.activeIp;
+    return <>
+      <div className="usage-head" style={{ justifyContent: "space-between" }}>
+        <select className="field" value={node.id} aria-label="选择优选节点" onChange={e => setSelectedId(e.target.value)}>{candidates.map(n => <option value={n.id} key={n.id}>{n.name} · :{n.localPort}</option>)}</select>
+        <span className="grow"/><TextBtn kind="action" disabled={inProgress || node.status !== "running"} onClick={() => nodeAction(node, "reselect")}><RotateCcw size={13}/> 重新优选</TextBtn>
+        <TextBtn onClick={() => openEdit(node)}>编辑节点</TextBtn>
+      </div>
+      <section className="rt">
+        <div className="rt-title"><b>{node.name}</b> <span>· 当前上游 IP · {node.status === "running" ? "运行中" : node.status === "error" ? "启动失败" : "未运行"}</span></div>
+        <div className="rt-desc">多地 DNS → TCPing → 根据全局策略选择出口。下方显示应用实际记录的 IP 与探测结果，不使用演示候选 IP。</div>
+        <div className="rt-flow" id="flow">
+          <svg className="wires" aria-hidden="true">{wirePaths.map((path,index) => <path key={index} d={path.d} fill="none" stroke={path.color} strokeWidth={1.5} strokeDasharray={path.dashed ? "3 4" : undefined} />)}</svg>
+          <div className="rt-src" id="src"><div className="ic">💻</div><div><div className="n"><span className={cn("dot", dotClass(node.status))}/>本机应用</div><div className="s">socks5h://:{node.localPort}</div></div></div>
+          <div className="rt-hub" id="hub"><Network size={22}/><div className="n">SocksNode</div><div className="s">{node.server}</div><span className="badge">{settings ? STRATEGIES.find(([k]) => k === settings.selectStrategy)?.[1] || "自动优选" : "自动优选"}</span></div>
+          <div className="rt-ips" id="ips">
+            <div className={cn("ipr", value && "use")}><span className="o"/><span className="ip">{value || "尚未选定上游 IP"}</span><span className="r">{node.lastProbe?.ms != null ? node.lastProbe.ms + " ms" : "—"}</span></div>
+            <div className="ipr"><span className="o"/><span className="ip">{node.server}</span><span className="r">原始服务器</span></div>
+            {!value && <div className="ipr bad"><span className="o"/><span className="ip">启动节点后展示优选结果</span></div>}
           </div>
         </div>
-      </Dialog>
+        <div className="rt-foot">
+          <div className="say"><strong>{value ? "当前生效：" + value : "等待选定出口"}</strong><div className="sub">{node.lastProbe?.at ? "最近探测：" + new Date(node.lastProbe.at).toLocaleString() : "尚无探测记录"}</div></div>
+          <div className="kpi"><b>{node.lastProbe?.ms ?? "—"}</b><span>最近 TCPing · ms</span></div>
+          <div className="kpi"><b>{node.lastProbe ? (node.lastProbe.ok ? "正常" : "失败") : "—"}</b><span>探测结果</span></div>
+        </div>
+        <div className="rt-why"><h5>选择说明</h5><ul><li className="hi">运行时选定的上游地址会保存在节点记录中，停止后可能保留为下次启动的参考。</li><li>当前应用只公开最终 IP 和最后一次探测；多候选排名和测速记录尚未提供给前端。</li>{node.lastProbe?.message && <li>{node.lastProbe.message}</li>}</ul></div>
+      </section>
+      <RowHead label="支持优选的节点" right={<span className="note">点击切换详情</span>}/>
+      <div className="list">{candidates.map(n => <div className="row" key={n.id}><span className="ic">{flag(n.name)}</span><div className="who"><div className="name">{n.name}<span className="tagc">:{n.localPort}</span></div><div className="sub">{n.activeIp || "尚未优选"} · {n.status === "running" ? "运行中" : "未运行"}</div></div><TextBtn onClick={() => setSelectedId(n.id)}>查看 <ChevronRight size={13}/></TextBtn></div>)}</div>
+    </>;
+  };
 
-      <Dialog
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        title="设置"
-        description="iLatency 多地 DNS 与上游 IP 探活。"
-        busy={settingsBusy}
-        className="max-w-[560px]"
-        footer={
-          <>
-            <Button
-              variant="secondary"
-              disabled={settingsBusy}
-              onClick={() => setSettingsOpen(false)}
-            >
-              取消
-            </Button>
-            <Button
-              variant="outline"
-              loading={settingsBusy && settingsBusyLabel.includes("iLatency")}
-              disabled={settingsBusy}
-              onClick={testIlatency}
-            >
-              测试会话
-            </Button>
-            <Button
-              loading={settingsBusy && settingsBusyLabel.includes("保存")}
-              disabled={settingsBusy}
-              onClick={saveSettings}
-            >
-              保存
-            </Button>
-          </>
-        }
-      >
-        <div className="space-y-4">
-          <div className="rounded-md bg-secondary/40 p-3 text-[11px] leading-5 text-muted-foreground">
-            浏览器登录{" "}
-            <span className="font-mono text-foreground">ilatency.com</span>{" "}
-            后复制 Cookie：
-            <span className="font-mono text-foreground">
-              {" "}
-              nodeping_user_session
-            </span>{" "}
-            与{" "}
-            <span className="font-mono text-foreground">sl-session</span>
-            <div className="mt-1 font-mono text-[10px] text-foreground/80">
-              nodeping_user_session=...; sl-session=...
+  const renderLatency = () => {
+    const samples = nodes.map(n => ({ node: n, ms: runtimeLatency(n) })).filter(x => x.ms != null);
+    const average = samples.length ? Math.round(samples.reduce((acc, s) => acc + (s.ms || 0), 0) / samples.length) : null;
+    const max = Math.max(1, ...samples.map(s => s.ms || 0));
+    return <>
+      <div className="usage-head"><span className="label">当前快照</span><span className="grow"/><span className="total">{average == null ? "—" : average + " ms"}<small>已测节点平均延迟</small></span></div>
+      <div className="qcards">{(running.length ? running : nodes.slice(0,3)).map(n => <div className="qcard" key={n.id}><div className="h"><span className="ic">{flag(n.name)}</span>{n.name}</div><div className="b"><span>{n.status === "running" ? "最近测得" : "未运行"}</span><b className={latClass(runtimeLatency(n))}>{runtimeLatency(n) == null ? "—" : runtimeLatency(n) + " ms"}</b></div></div>)}</div>
+      <div className="stats"><div className="stat"><b>{running.length}</b><div className="l">运行中</div><div className="d">共 {nodes.length} 个节点</div></div>
+        <div className="stat"><b>{samples.length}</b><div className="l">已有探测数据</div><div className="d">延迟或 TCPing 快照</div></div>
+        <div className="stat"><b>{errors.length}</b><div className="l">启动异常</div><div className="d">需要检查日志</div></div>
+        <div className="stat"><b>{average ?? "—"}</b><div className="l">平均 ms</div><div className="d">仅统计已有结果</div></div>
+      </div>
+      <RowHead label="按节点" right={<TextBtn kind="action" disabled={inProgress} onClick={() => allAction("test")}><Activity size={13}/> 全部测延迟</TextBtn>}/>
+      {nodes.length ? <div className="list">{nodes.map(n => { const ms = runtimeLatency(n); return <div className="row stat-row" key={n.id}>
+        <div className="who" style={{ display: "flex", gap: 10, alignItems: "center" }}><span className="ic">{flag(n.name)}</span><span className="name">{n.name}</span></div>
+        <div className="share"><i style={{ width: ms == null ? 0 : Math.max(3, (ms / max) * 100) + "%" }}/></div>
+        <div className="nums"><b className={latClass(ms)}>{ms == null ? "—" : ms + " ms"}</b><small>{n.lastTest?.ok ? "SOCKS 测试" : n.lastProbe?.ms != null ? "TCPing" : "未测"}</small></div>
+        <TextBtn disabled={inProgress || n.status !== "running"} onClick={() => nodeAction(n, "test")}>测试</TextBtn>
+      </div>; })}</div> : <Empty title="没有延迟数据">添加节点并启动后可进行延迟测试。</Empty>}
+      <p className="lede" style={{ marginTop: 12 }}>目前后端提供的是最近一次探测和测试结果，未保存 7 天或 30 天的历史时序数据，因此这里不展示虚构的历史图表。</p>
+    </>;
+  };
+
+  const renderLogs = () => {
+    const classify = (text: string): "ok" | "warn" | "err" | "info" => /\b(error|failed|fail|panic|fatal|拒绝|失败|错误)\b/i.test(text) ? "err" : /\b(warn|timeout|重试|警告|超时)\b/i.test(text) ? "warn" : /\b(ok|success|ready|started|listening|成功|完成|已启动)\b/i.test(text) ? "ok" : "info";
+    const filtered = logEntries.filter(e => logFilter === "all" || (logFilter === "ok" ? classify(e.line) === "ok" : ["warn", "err"].includes(classify(e.line))));
+    return <>
+      <div className="usage-head">
+        <select className="field" value={selectedId ?? ""} onChange={e => setSelectedId(e.target.value)} aria-label="选择日志节点">{nodes.map(n => <option key={n.id} value={n.id}>{n.name}</option>)}</select>
+        <Segment value={logFilter} onChange={setLogFilter} options={[["all", "全部"], ["ok", "成功"], ["warn", "警告与错误"]]}/>
+        <span className="grow"/><TextBtn kind="action" onClick={() => { if (selectedId) void api.logs(selectedId).then(setLogEntries).catch(e => toast(errMessage(e), "err")); }}><RefreshCw size={13}/> 刷新</TextBtn>
+      </div>
+      <div className="logwrap"><div className="list">{filtered.length ? filtered.map((entry,i) => { const level = classify(entry.line); return <div key={entry.ts + i} className="ln"><span className="ts">{fmtTime(entry.ts)}</span><span className={cn("lv", level)}>{level.toUpperCase()}</span><span>{entry.line}</span></div>; }) : <div className="empty-state"><b>暂无日志</b>节点启动后，DNS、tcping、测速和进程日志会出现在这里。</div>}</div></div>
+    </>;
+  };
+
+  const renderSettings = () => {
+    if (!settings) return <Empty title="正在读取设置">请检查后端服务是否正常运行。</Empty>;
+    const s = settings;
+    const buttons: [SettingsTab, string][] = [["general", "通用"], ["select", "优选与测速"], ["network", "网络与共享"], ["ilatency", "iLatency"], ["about", "关于"]];
+    const number = (value: number, unit: string, min: number, max: number, setter: (value: number) => void) => <NumericSetting value={value} unit={unit} min={min} max={max} disabled={inProgress} onSave={setter} />;
+    const boolControl = (value: boolean, field: keyof AppSettingsPatch) => <Segment value={value ? "true" : "false"} options={[["true", "开"], ["false", "关"]]} disabled={inProgress} onChange={v => void applySettings({ [field]: v === "true" })}/>;
+    return <>
+      <div className="row-head set-head"><div className="warm-tabs">{buttons.map(([key,text]) => <button className={cn(setTab === key && "on")} key={key} onClick={() => setSetTab(key)}>{text}</button>)}</div></div>
+      <div className="list">
+        {setTab === "general" && <>
+          <PrefRow title="外观" description="浅色、深色，或跟随 macOS 系统" control={<Segment value={theme} options={[["system","跟随系统"],["light","浅色"],["dark","深色"]]} onChange={setTheme}/>}/>
+          <PrefRow title="登录时打开" description={<>注册 macOS 登录项，开机自动启动 SocksNode{!s.launchAtLoginActive && s.launchAtLogin && <span className="sub err"> · 登录项未生效</span>}</>} control={boolControl(s.launchAtLogin, "launchAtLogin")}/>
+          <PrefRow title="启动时最小化" description="登录启动时不弹出主窗口" control={<Segment value={s.startMinimized ? "true" : "false"} options={[["true","开"],["false","关"]]} disabled={inProgress || !s.launchAtLogin} onChange={v => void applySettings({ startMinimized: v === "true" })}/>}/>
+          <PrefRow title="打开时启动节点" description="仅启动标记为「参与全部启动」的节点" control={boolControl(s.autoStartNodes, "autoStartNodes")}/>
+        </>}
+        {setTab === "select" && <>
+          <PrefRow title="优选策略" description="多地 DNS → TCPing → Top K 测速 → 选择最快出口" control={<Segment value={s.selectStrategy as SelectStrategy} options={STRATEGIES} disabled={inProgress} onChange={v => void applySettings({ selectStrategy: v })}/>}/>
+          <PrefRow title="测速候选数" description="TCPing 最快的前 K 个参与测速，范围 1–8" control={number(s.speedTopK, "个", 1, 8, v => void applySettings({ speedTopK: v }))}/>
+          <PrefRow title="测速下载量" description="每个候选的下载量，1–50 MB" control={number(Math.round(s.speedTestBytes / 1048576), "MB", 1, 50, v => void applySettings({ speedTestBytes: v * 1048576 }))}/>
+          <PrefRow title="测速超时" description="单个测速请求允许的最长时间" control={number(s.speedTestTimeoutSecs, "秒", 3, 60, v => void applySettings({ speedTestTimeoutSecs: v }))}/>
+          <PrefRow title="探活间隔" description="运行中上游健康检查的间隔，3–120 秒" control={number(s.healthIntervalSecs, "秒", 3, 120, v => void applySettings({ healthIntervalSecs: v }))}/>
+          <PrefRow title="切换冷却" description="上游故障重新优选后，最短冷却间隔，15–600 秒" control={number(s.failoverCooldownSecs, "秒", 15, 600, v => void applySettings({ failoverCooldownSecs: v }))}/>
+        </>}
+        {setTab === "network" && <>
+          <PrefRow title="默认监听" description="不开局域网连入时，SOCKS5 仅监听本机 127.0.0.1" control={<span className="mono">127.0.0.1</span>}/>
+          <PrefRow title="局域网共享" description="可以在「上游」中单独为每个节点打开或关闭" control={<TextBtn kind="action" onClick={() => changePage("upstreams")}>管理节点 <ChevronRight size={13}/></TextBtn>}/>
+          <PrefRow title="认证" description="内核暂不支持 SOCKS5 用户名密码。启用局域网接入后，同网段其他设备可以直接使用代理。" control={<span className="pillt" style={{ color: "var(--amber)" }}>不支持</span>}/>
+          <PrefRow title="物理出口" description="优先选择物理 IPv4 网卡。网络切换后，正在运行的内核可能需要重启。" control={<span className="note">自动检测</span>}/>
+        </>}
+        {setTab === "ilatency" && <>
+          <PrefRow title="多地 DNS 会话" description={s.hasIlatencyCookie ? "已配置 Cookie · " + s.ilatencyCookiePreview : "未配置时使用本机 DNS 和公共 DoH"} control={<span className={cn("pillt", s.hasIlatencyCookie && "ok-txt")}>{s.hasIlatencyCookie ? "已配置" : "未配置"}</span>}/>
+          <div className="row pref"><div className="who"><div className="name">会话 Cookie</div><div className="sub wrap">输入新 Cookie 后可先验证，只有点击保存才会更新本地配置</div></div>
+            <input className="inp mono" style={{ width: "min(300px,40%)" }} type="password" autoComplete="off" value={cookieDraft} placeholder={s.hasIlatencyCookie ? "留空保留现有 Cookie" : "nodeping_user_session=..."} onChange={e => setCookieDraft(e.target.value)}/>
             </div>
-            {settings?.hasIlatencyCookie ? (
-              <div className="mt-2 text-success">
-                已配置
-                {settings.ilatencyUser ? ` · ${settings.ilatencyUser}` : ""}
-                {settings.ilatencyCookiePreview
-                  ? ` · ${settings.ilatencyCookiePreview}`
-                  : ""}
-              </div>
-            ) : (
-              <div className="mt-2 text-destructive">
-                未配置时仅本机 DNS + 公共 DoH，分运营商覆盖不全。
-              </div>
-            )}
-          </div>
-          <Field label="iLatency Cookie">
-            <Input
-              type="password"
-              autoComplete="off"
-              value={cookieDraft}
-              onChange={(e) => setCookieDraft(e.target.value)}
-              placeholder={
-                settings?.hasIlatencyCookie
-                  ? "留空则保留已保存 Cookie"
-                  : "nodeping_user_session=...; sl-session=..."
-              }
-            />
-          </Field>
-          <div className="space-y-2 rounded-md bg-secondary/40 p-3">
-            <div className="text-xs font-medium">启动行为</div>
-            <Checkbox
-              id="launch-at-login"
-              label="开机自启"
-              checked={launchAtLogin}
-              onCheckedChange={(v) => {
-                setLaunchAtLogin(v);
-                if (!v) setStartMinimized(false);
-              }}
-              disabled={settingsBusy}
-            />
-            <Checkbox
-              id="start-minimized"
-              label="开机后最小化到托盘"
-              checked={launchAtLogin && startMinimized}
-              onCheckedChange={setStartMinimized}
-              disabled={settingsBusy || !launchAtLogin}
-            />
-            <Checkbox
-              id="auto-start-nodes"
-              label="启动应用时自动启动全部节点"
-              checked={autoStartNodes}
-              onCheckedChange={setAutoStartNodes}
-              disabled={settingsBusy}
-            />
-            {settings?.launchAtLogin && !settings.launchAtLoginActive ? (
-              <p className="text-[11px] text-amber-700 dark:text-amber-400">
-                已勾选开机自启，但系统登录项尚未生效。保存后会重新注册。
-              </p>
-            ) : null}
-          </div>
-          <Field label="优选策略">
-            <select
-              className="flex h-8 w-full rounded-md border border-input bg-secondary/55 px-2.5 text-xs outline-none focus:bg-background focus:ring-1 focus:ring-ring"
-              value={selectStrategy}
-              onChange={(e) => setSelectStrategy(e.target.value)}
-            >
-              <option value="throughput">高带宽优先（推荐）</option>
-              <option value="balanced">均衡（速度 / 延迟）</option>
-              <option value="latency">低延迟优先</option>
-            </select>
-          </Field>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="探活间隔（秒）">
-              <Input
-                type="number"
-                min={3}
-                max={120}
-                value={healthInterval}
-                onChange={(e) => setHealthInterval(Number(e.target.value) || 5)}
-              />
-            </Field>
-            <Field label="切换冷却（秒）">
-              <Input
-                type="number"
-                min={15}
-                max={600}
-                value={failoverCooldown}
-                onChange={(e) =>
-                  setFailoverCooldown(Number(e.target.value) || 60)
-                }
-              />
-            </Field>
-            <Field label="测速候选数 Top K">
-              <Input
-                type="number"
-                min={1}
-                max={8}
-                value={speedTopK}
-                onChange={(e) => setSpeedTopK(Number(e.target.value) || 3)}
-              />
-            </Field>
-            <Field label="测速下载量（MB）">
-              <Input
-                type="number"
-                min={1}
-                max={50}
-                step={1}
-                value={speedTestMb}
-                onChange={(e) => setSpeedTestMb(Number(e.target.value) || 1)}
-              />
-            </Field>
-          </div>
-          <p className="text-[11px] leading-5 text-muted-foreground">
-            启动：多地 DNS → tcping → Top K 单线程测速（LibreSpeed，经 anytls 出口）→ 策略决选。运行中按间隔探活，失败后重选。
-          </p>
-        </div>
-      </Dialog>
-    </div>
-  );
+          <div className="row pref"><span className="grow"/><TextBtn kind="action" disabled={inProgress} onClick={() => void testIlatency()}>测试会话</TextBtn><TextBtn kind="primary" disabled={inProgress || !cookieDraft.trim()} onClick={() => void applySettings({ ilatencyCookie: cookieDraft.trim() }).then(ok => { if (ok) setCookieDraft(""); })}>保存 Cookie</TextBtn></div>
+        </>}
+        {setTab === "about" && <>
+          <PrefRow title="SocksNode" description="Tauri 2 · AnyTLS SOCKS5 桌面管理工具" control={<span className="mono">v{info?.version || "—"}</span>}/>
+          <PrefRow title="内置内核" description="项目定制的 AnyTLS-Go 客户端" control={<span className="mono">socksnode5</span>}/>
+          <PrefRow title="数据目录" description={<span className="mono">{info?.dataDir || "—"}</span>} control={<TextBtn kind="action" onClick={() => { if (info) void api.openPath(info.dataDir).catch(e => toast(errMessage(e),"err")); }}><FolderOpen size={13}/> 打开</TextBtn>}/>
+          <PrefRow title="源代码" description="开源项目仓库" control={<TextBtn kind="action" onClick={() => void api.openPath("https://github.com/ct-jyjntc/SocksNode").catch(e => toast(errMessage(e), "err"))}><GitBranch size={13}/> GitHub</TextBtn>}/>
+        </>}
+      </div>
+      <p className="lede" style={{ marginTop: 12 }}>设置更改直接写入本机配置。节点密码用于 AnyTLS 连接，Cookie 在访问 iLatency 服务时使用。</p>
+    </>;
+  };
+
+  const renderContent = () => {
+    switch (page) {
+      case "nodes": return renderNodes();
+      case "upstreams": return renderUpstreams();
+      case "gateway": return renderGateway();
+      case "routing": return renderRouting();
+      case "latency": return renderLatency();
+      case "logs": return renderLogs();
+      case "settings": return renderSettings();
+    }
+  };
+
+  const closeWindow = (action: "close" | "minimize" | "maximize") => {
+    const win = getCurrentWindow();
+    const task = action === "close" ? win.close() : action === "minimize" ? win.minimize() : win.toggleMaximize();
+    void task.catch(e => toast(errMessage(e), "err"));
+  };
+
+  const statusText = flash?.text || (loading ? "正在加载节点…" : busy || running.length + " 个节点在监听 · " + errors.length + " 个异常");
+  return <div style={{ display: "flex", flexDirection: "column", width: "100%", height: "100%", minHeight: 0 }}>
+    <header className="top">
+      <div className="lights">
+        <button title="关闭窗口" aria-label="关闭窗口" onClick={() => closeWindow("close")}><i/></button>
+        <button title="最小化" aria-label="最小化" onClick={() => closeWindow("minimize")}><i/></button>
+        <button title="最大化或还原" aria-label="最大化或还原" onClick={() => closeWindow("maximize")}><i/></button>
+      </div>
+      <div className="brand"><Network size={18} strokeWidth={2}/><span>SocksNode</span></div>
+      <nav className="seg" aria-label="主导航">{NAV.map(([key, label]) => <button key={key} className={cn(page === key && "on", key === "nodes" && errors.length > 0 && "has-dot")} onClick={() => changePage(key)}>{label}</button>)}</nav>
+      <div className="actions">
+        <IconBtn title="刷新状态" disabled={inProgress} onClick={() => void refresh().then(() => toast("状态已刷新")).catch(e => toast(errMessage(e), "err"))}><RefreshCw size={15}/></IconBtn>
+        <IconBtn title="切换主题" onClick={() => setTheme(value => value === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={15}/> : <Moon size={15}/>}</IconBtn>
+        <IconBtn title="设置 ⌘," onClick={() => changePage(page === "settings" ? "nodes" : "settings")}><Settings2 size={16}/></IconBtn>
+      </div>
+    </header>
+    <main className={cn("view", !["routing", "latency"].includes(page) && "narrow")} key={page}>{renderContent()}</main>
+    <footer className="foot"><span className={cn("status", flash?.tone || (errors.length ? "warn" : ""))}>{flash?.tone === "ok" && <Check size={13} />}{statusText}</span><span className="grow"/><span className="note">{nodes.length} 个节点 · v{info?.version || "1.0.0"}</span></footer>
+    {confirmDelete && <div className="modal" onMouseDown={e => { if (e.target === e.currentTarget) setConfirmDelete(null); }}>
+      <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title">
+        <b id="delete-title">删除「{nodes.find(n => n.id === confirmDelete)?.name}」？</b>
+        <p>节点会先停止，然后删除它的配置及运行日志。此操作无法撤销。</p>
+        <div className="btns"><TextBtn kind="action" onClick={() => setConfirmDelete(null)}>取消</TextBtn>
+        <TextBtn kind="primary" disabled={inProgress} onClick={() => { const id = confirmDelete; setConfirmDelete(null); void perform("正在删除节点…", async () => { await api.remove(id); setEditorId(null); }, "节点已删除"); }}>确认删除</TextBtn></div>
+      </div>
+    </div>}
+  </div>;
 }
 
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="space-y-1.5">
-      <Label>{label}</Label>
-      {children}
-    </div>
-  );
-}
-
-function EndpointChip({
-  label,
-  value,
-  mono,
-  onCopy,
-}: {
-  label: string;
-  value: string;
-  mono?: string;
-  onCopy?: () => void;
-}) {
-  return (
-    <div className="rounded-md bg-secondary/40 px-2.5 py-2">
-      <div className="text-[10px] text-muted-foreground">{label}</div>
-      {onCopy ? (
-        <button
-          type="button"
-          className="mt-0.5 inline-flex max-w-full items-center gap-1.5 font-mono text-[12px] hover:underline"
-          onClick={onCopy}
-          title={mono || value}
-        >
-          <span className="truncate">{value}</span>
-          <Copy className="size-3 shrink-0 opacity-50" strokeWidth={1.7} />
-        </button>
-      ) : (
-        <div className="mt-0.5 truncate font-mono text-[12px]">{value}</div>
-      )}
-    </div>
-  );
-}
+export default App;
