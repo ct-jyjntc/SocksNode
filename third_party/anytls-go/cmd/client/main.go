@@ -27,6 +27,7 @@ func main() {
 	bindIP := flag.String("bind", "", "Outbound local IPv4 bind (physical NIC). Empty=auto-detect")
 	bindIF := flag.String("iface", "", "Outbound interface name for IP_BOUND_IF (macOS), e.g. en0")
 	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (unsafe)")
+	udpEnabled := flag.Bool("udp", true, "Allow SOCKS5 UDP ASSOCIATE")
 	flag.Parse()
 	if *password == "" {
 		*password = os.Getenv("SOCKSNODE_PASSWORD")
@@ -99,7 +100,7 @@ func main() {
 
 	path := strings.TrimSpace(os.Getenv("TLS_KEY_LOG"))
 	if path != "" {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 		if err == nil {
 			tlsConfig.KeyLogWriter = f
 		}
@@ -113,7 +114,7 @@ func main() {
 		}
 		conn = tls.Client(conn, tlsConfig)
 		return conn, nil
-	}, *minIdleSession, *disableReuse)
+	}, *minIdleSession, *disableReuse, *udpEnabled)
 
 	for {
 		c, err := listener.Accept()

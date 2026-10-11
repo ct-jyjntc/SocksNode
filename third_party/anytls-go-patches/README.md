@@ -1,6 +1,6 @@
 # anytls-client UDP fix
 
-Bundled kernel: `anytls/0.0.13-socksnode4`
+Bundled kernel: `anytls/0.0.13-socksnode5`
 
 ## Problem
 
@@ -27,6 +27,7 @@ In `cmd/client/inbound.go` `NewPacketConnection`:
 `third_party/anytls-go/` is a fork snapshot of the kernel used to build the
 bundled binary. On top of the UDP fix it also adds:
 
+- `-udp=false` — reject UDP when a node disables UDP.
 - `-insecure` (default `false`) — opt-in TLS certificate verification skip,
   driven by the per-node `skipCertVerify` setting.
 - `-bind <ipv4>` / `-iface <name>` — force outbound dials onto a physical NIC
@@ -40,11 +41,9 @@ matches `src-tauri/resources/anytls-client`.
 ## Rebuild
 
 ```bash
-git clone https://github.com/anytls/anytls-go.git
-cd anytls-go
-git apply /path/to/0001-fix-socks5-udp-associate-destination.patch
-go build -trimpath -ldflags '-s -w' -o anytls-client ./cmd/client
-cp anytls-client /path/to/ScoksNode/src-tauri/resources/anytls-client
+# Run from the SocksNode repository root.
+cd third_party/anytls-go
+go build -trimpath -ldflags '-s -w' -o ../../src-tauri/resources/anytls-client ./cmd/client
 ```
 
 ## Verify

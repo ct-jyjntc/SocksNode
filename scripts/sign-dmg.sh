@@ -7,7 +7,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="${APP:-$ROOT/src-tauri/target/release/bundle/macos/SocksNode.app}"
 OUT_DIR="${OUT_DIR:-$ROOT}"
-VERSION="$(python3 -c "import json; print(json.load(open('$ROOT/src-tauri/tauri.conf.json'))['version'])")"
+VERSION="$(python3 - "$ROOT/src-tauri/tauri.conf.json" <<'PY_VERSION'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as config:
+    print(json.load(config)["version"])
+PY_VERSION
+)"
 OUT_DMG="$OUT_DIR/SocksNode-${VERSION}-arm64.dmg"
 IDENTITY_NAME="SocksNode Developer"
 LOGIN_KC="$HOME/Library/Keychains/login.keychain-db"
@@ -143,13 +149,17 @@ EOF
 chmod +x "$STAGE/首次打开.command"
 
 echo "[dmg] $OUT_DMG"
-rm -f "$OUT_DMG" "$TMP/rw.dmg"
+# Build and verify in the temporary directory; never delete the previous DMG
+# until the replacement has passed signature checks.
+STAGED_DMG="$TMP/SocksNode-$VERSION-arm64.dmg"
 hdiutil create -volname "SocksNode" -srcfolder "$STAGE" -ov -format UDRW "$TMP/rw.dmg" >/dev/null
-hdiutil convert "$TMP/rw.dmg" -format UDZO -imagekey zlib-level=9 -o "$OUT_DMG" >/dev/null
-sign "$OUT_DMG"
+hdiutil convert "$TMP/rw.dmg" -format UDZO -imagekey zlib-level=9 -o "$STAGED_DMG" >/dev/null
+sign "$STAGED_DMG"
 
 echo "[verify] dmg"
-codesign --verify --verbose=2 "$OUT_DMG"
-codesign -dv --verbose=2 "$OUT_DMG" 2>&1 | sed -n '1,10p'
+codesign --verify --verbose=2 "$STAGED_DMG"
+codesign -dv --verbose=2 "$STAGED_DMG" 2>&1 | sed -n '1,10p'
+mkdir -p "$OUT_DIR"
+mv -f "$STAGED_DMG" "$OUT_DMG"
 ls -lh "$OUT_DMG"
 echo "ok: $OUT_DMG"

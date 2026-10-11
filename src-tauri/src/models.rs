@@ -273,6 +273,17 @@ pub fn store_to_json(nodes: &[ProxyNode]) -> Result<String, serde_json::Error> {
 
 pub fn store_from_json(raw: &str) -> Result<Vec<ProxyNode>, serde_json::Error> {
     let store: StoreFile = serde_json::from_str(raw)?;
+    let mut seen = std::collections::HashSet::new();
+    for node in &store.nodes {
+        // Node ids are used as directory names and receive untrusted IPC input.
+        // Reject path traversal, invalid ids, and duplicates in hand-edited files.
+        if uuid::Uuid::parse_str(&node.id).is_err() || !seen.insert(&node.id) {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "节点配置包含非法或重复 ID",
+            )));
+        }
+    }
     Ok(store
         .nodes
         .into_iter()

@@ -14,13 +14,15 @@ import (
 )
 
 type myClient struct {
+	allowUDP      bool
 	dialOut       util.DialOutFunc
 	sessionClient *session.Client
 }
 
-func NewMyClient(ctx context.Context, dialOut util.DialOutFunc, minIdleSession int, disableReuse bool) *myClient {
+func NewMyClient(ctx context.Context, dialOut util.DialOutFunc, minIdleSession int, disableReuse, allowUDP bool) *myClient {
 	s := &myClient{
-		dialOut: dialOut,
+		allowUDP: allowUDP,
+		dialOut:  dialOut,
 	}
 	s.sessionClient = session.NewClient(ctx, s.createOutboundConnection, &padding.DefaultPaddingFactory, time.Second*30, time.Second*30, minIdleSession, disableReuse)
 	return s

@@ -29,7 +29,8 @@ export const api = {
   getSettings: () => invoke<AppSettingsView>("settings_get"),
   updateSettings: (patch: AppSettingsPatch) =>
     invoke<AppSettingsView>("settings_update", { patch }),
-  testIlatency: () => invoke<string>("settings_test_ilatency"),
+  testIlatency: (cookie?: string) =>
+    invoke<string>("settings_test_ilatency", { cookie }),
   onChanged: (cb: (nodes: ProxyNode[]) => void): (() => void) => {
     let unlisten: UnlistenFn | undefined;
     let disposed = false;

@@ -168,10 +168,23 @@ pub fn egress_log_line() -> String {
     }
 }
 
-/// Cached physical egress for the process lifetime (refresh on demand if needed).
-pub fn cached_egress() -> Option<&'static PhysicalEgress> {
-    static E: OnceLock<Option<PhysicalEgress>> = OnceLock::new();
-    E.get_or_init(detect_physical_egress).as_ref()
+/// Cache the physical NIC briefly, not for the lifetime of the app. A Mac can
+/// switch between Wi-Fi, Ethernet and hotspots while SocksNode stays in tray.
+pub fn cached_egress() -> Option<PhysicalEgress> {
+    type Cached = Option<(std::time::Instant, Option<PhysicalEgress>)>;
+    static CACHE: OnceLock<parking_lot::Mutex<Cached>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(None));
+    {
+        let cached = cache.lock();
+        if let Some((at, value)) = cached.as_ref() {
+            if at.elapsed() < Duration::from_secs(10) {
+                return value.clone();
+            }
+        }
+    }
+    let current = detect_physical_egress();
+    *cache.lock() = Some((std::time::Instant::now(), current.clone()));
+    current
 }
 
 /// DoH resolvers as IP literals (never hostnames — avoids fake-ip for the resolver itself).
@@ -187,7 +200,9 @@ const DOH_IP_ENDPOINTS: &[&str] = &[
 
 fn curl_base(interface: Option<&str>) -> Command {
     let mut cmd = Command::new("curl");
-    cmd.args(["-sS", "-L"])
+    // Do not follow redirects while forwarding session Cookies. Redirecting
+    // to a different host could disclose private headers or bypass --resolve.
+    cmd.arg("-sS")
         .env("NO_PROXY", "*")
         .env("no_proxy", "*")
         .env("ALL_PROXY", "")
@@ -382,7 +397,16 @@ pub fn curl_json_direct(
             .spawn()
             .map_err(|e| format!("curl 启动失败: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&payload).map_err(|e| e.to_string())?;
+            if let Err(e) = stdin.write_all(&payload) {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("curl 请求体写入失败: {e}"));
+            }
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("curl 标准输入不可用".into());
         }
         child.wait_with_output().map_err(|e| e.to_string())?
     } else {
@@ -405,12 +429,8 @@ pub fn curl_json_direct(
     if text.trim().is_empty() {
         return Err("curl 返回空响应".into());
     }
-    serde_json::from_str(text.trim()).map_err(|e| {
-        format!(
-            "JSON 解析失败: {e}; body={}",
-            text.chars().take(180).collect::<String>()
-        )
-    })
+    // Response bodies may contain credentials; do not include them in logs.
+    serde_json::from_str(text.trim()).map_err(|e| format!("JSON 解析失败: {e}"))
 }
 
 /// Result of a SOCKS download sample (body-only throughput).
@@ -599,7 +619,7 @@ fn tcping_once(ip_addr: IpAddr, port: u16, timeout: Duration) -> Option<u64> {
         socket.bind(&local.into()).ok()?;
         // LocalAddr bind is the primary anti-utun measure. IP_BOUND_IF is best-effort;
         // some paths are fine with LocalAddr alone.
-        let _ = bind_socket_to_iface(&socket, egress, true);
+        let _ = bind_socket_to_iface(&socket, &egress, true);
     }
 
     let start = std::time::Instant::now();

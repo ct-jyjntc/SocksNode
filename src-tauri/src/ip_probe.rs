@@ -164,12 +164,18 @@ pub fn probe_all(ips: &[String], port: u16, timeout: Duration) -> Vec<ProbeResul
         return Vec::new();
     }
     let (tx, rx) = mpsc::channel();
-    for ip in ips {
-        let ip = ip.clone();
-        let tx = tx.clone();
-        thread::spawn(move || {
-            let ms = tcping(&ip, port, timeout);
-            let _ = tx.send(ProbeResult { ip, ms });
+    // Do not spawn one thread for every DNS result; a large iLatency response
+    // should never exhaust the process's thread resources.
+    for batch in ips.chunks(16) {
+        thread::scope(|scope| {
+            for ip in batch {
+                let ip = ip.clone();
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let ms = tcping(&ip, port, timeout);
+                    let _ = tx.send(ProbeResult { ip, ms });
+                });
+            }
         });
     }
     drop(tx);

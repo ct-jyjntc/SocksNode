@@ -3,6 +3,7 @@ package main
 import (
 	std_bufio "bufio"
 	"context"
+	"errors"
 	"net"
 	"runtime/debug"
 
@@ -59,6 +60,9 @@ func (c *myClient) NewConnection(ctx context.Context, conn net.Conn, metadata M.
 }
 
 func (c *myClient) NewPacketConnection(ctx context.Context, conn network.PacketConn, metadata M.Metadata) error {
+	if !c.allowUDP {
+		return errors.New("SOCKS5 UDP is disabled for this node")
+	}
 	// SOCKS5 UDP ASSOCIATE often reports destination as 0.0.0.0:0.
 	// Many server implementations (sing-box/mihomo) use the UoT request
 	// destination for routing/ACL at handshake time. Advertising 0.0.0.0:0

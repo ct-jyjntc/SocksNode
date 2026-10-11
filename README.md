@@ -3,8 +3,8 @@
 把上游代理节点（如 anytls）转发为本地 SOCKS5 的轻量桌面工具。
 
 - 内置 `anytls-client` 内核（约 6MB，替代原 41MB mihomo）
-- 已打补丁支持 SOCKS5 UDP（UoT 握手使用真实目标地址），并扩展了 `-bind` / `-iface` / `-insecure`，密码通过 `SOCKSNODE_PASSWORD` 环境变量传入（版本 `anytls/0.0.13-socksnode4`）
-- 每个节点独立进程
+- 已打补丁支持 SOCKS5 UDP（UoT 握手使用真实目标地址），并扩展了 `-udp` / `-bind` / `-iface` / `-insecure`，密码通过 `SOCKSNODE_PASSWORD` 环境变量传入（版本 `anytls/0.0.13-socksnode5`）
+- 每个节点独立进程；禁用 UDP 的节点会向内核传入 `-udp=false`
 - 仅本地 SOCKS，不启用系统代理 / TUN
 - Quiet Console 风格界面
 - **Tauri 2** 壳（系统 WebView 壳）
@@ -53,3 +53,15 @@ npm run build
 - 「运行中」= 本地 SOCKS 已监听；真正连通请点「测试」
 - 关闭窗口 → 隐藏到菜单栏托盘，并隐藏 Dock 图标
 - 托盘可：显示主窗口 / 全部启动 / 全部停止 / 退出
+
+## 静态检查
+
+源码自检命令（不访问实际代理节点）：
+
+```bash
+npm run build:web
+cd src-tauri && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
+cd ../third_party/anytls-go && go test ./... && go vet ./...
+```
+
+Rust/TypeScript/Go 静态检查不能代替真实 AnyTLS 连接、SOCKS5 UDP、物理网卡绑定、菜单栏与 DMG 签名的端到端验证。

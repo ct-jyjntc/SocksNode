@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -63,6 +64,18 @@ fn port_is_free(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
         && TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
+fn wait_local_proxy_ready(port: u16, timeout: Duration) -> bool {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(120)).is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(60));
+    }
+    false
+}
+
 
 /// True only when pid is one of our bundled anytls-client processes.
 ///
@@ -84,7 +97,12 @@ fn pid_is_our_kernel(pid: u32, kernel: &std::path::Path) -> bool {
         .output();
     match output {
         Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).contains(kernel.as_ref())
+            let command = String::from_utf8_lossy(&out.stdout);
+            let command = command.trim();
+            command == kernel.as_ref()
+                || command
+                    .strip_prefix(kernel.as_ref())
+                    .is_some_and(|tail| tail.starts_with(char::is_whitespace))
         }
         _ => false,
     }
@@ -130,6 +148,7 @@ pub struct Manager {
     nodes: SharedNodes,
     processes: SharedProcs,
     logs: SharedLogs,
+    log_io: Arc<Mutex<()>>,
     settings: SharedSettings,
     last_failover_at: SharedFailoverAt,
     /// host -> (cached_at, ips); short TTL for multi-location DNS.
@@ -140,6 +159,7 @@ pub struct Manager {
     /// health/exit watchers terminate instead of piling up.
     generations: SharedGenerations,
     lifecycle_gates: SharedLifecycleGates,
+    batch_generation: Arc<AtomicU64>,
     is_shutting_down: Arc<Mutex<bool>>,
     app: Mutex<Option<AppHandle>>,
 }
@@ -157,25 +177,23 @@ impl Manager {
             nodes: Arc::new(Mutex::new(Vec::new())),
             processes: Arc::new(Mutex::new(HashMap::new())),
             logs: Arc::new(Mutex::new(HashMap::new())),
+            log_io: Arc::new(Mutex::new(())),
             settings: Arc::new(Mutex::new(settings)),
             last_failover_at: Arc::new(Mutex::new(HashMap::new())),
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
             starting_ids: Arc::new(Mutex::new(HashSet::new())),
             generations: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_gates: Arc::new(Mutex::new(HashMap::new())),
+            batch_generation: Arc::new(AtomicU64::new(0)),
             is_shutting_down: Arc::new(Mutex::new(false)),
             app: Mutex::new(None),
         }
     }
 
     pub fn get_settings_view(&self, launch_at_login_active: bool) -> AppSettingsView {
-        let settings = self.settings.lock().clone();
-        let user = if settings.ilatency_cookie.trim().is_empty() {
-            None
-        } else {
-            ilatency::session_username(&settings.ilatency_cookie).ok()
-        };
-        settings.to_view(user, launch_at_login_active)
+        // Local configuration reads must never block on a remote API call.
+        // The dedicated Test Session command explicitly validates credentials.
+        self.settings.lock().to_view(None, launch_at_login_active)
     }
 
     pub fn update_settings(
@@ -185,41 +203,43 @@ impl Manager {
     ) -> Result<AppSettingsView, String> {
         {
             let mut settings = self.settings.lock();
+            let mut pending = settings.clone();
             if let Some(cookie) = patch.ilatency_cookie {
-                settings.ilatency_cookie = cookie.trim().to_string();
+                pending.ilatency_cookie = cookie.trim().to_string();
             }
             if let Some(v) = patch.health_interval_secs {
-                settings.health_interval_secs = v.clamp(3, 120);
+                pending.health_interval_secs = v.clamp(3, 120);
             }
             if let Some(v) = patch.failover_cooldown_secs {
-                settings.failover_cooldown_secs = v.clamp(15, 600);
+                pending.failover_cooldown_secs = v.clamp(15, 600);
             }
             if let Some(s) = patch.select_strategy {
-                settings.select_strategy = SelectStrategy::parse(&s);
+                pending.select_strategy = SelectStrategy::parse(&s);
             }
             if let Some(v) = patch.speed_top_k {
-                settings.speed_top_k = v.clamp(1, 8);
+                pending.speed_top_k = v.clamp(1, 8);
             }
             if let Some(v) = patch.speed_test_bytes {
-                settings.speed_test_bytes = v.clamp(1024 * 1024, 50 * 1024 * 1024);
+                pending.speed_test_bytes = v.clamp(1024 * 1024, 50 * 1024 * 1024);
             }
             if let Some(v) = patch.speed_test_timeout_secs {
-                settings.speed_test_timeout_secs = v.clamp(10, 60);
+                pending.speed_test_timeout_secs = v.clamp(10, 60);
             }
             if let Some(v) = patch.launch_at_login {
-                settings.launch_at_login = v;
+                pending.launch_at_login = v;
             }
             if let Some(v) = patch.start_minimized {
-                settings.start_minimized = v;
+                pending.start_minimized = v;
             }
             if let Some(v) = patch.auto_start_nodes {
-                settings.auto_start_nodes = v;
+                pending.auto_start_nodes = v;
             }
             // Minimized login start only makes sense with launch-at-login.
-            if !settings.launch_at_login {
-                settings.start_minimized = false;
+            if !pending.launch_at_login {
+                pending.start_minimized = false;
             }
-            settings.save(&self.data_dir)?;
+            pending.save(&self.data_dir)?;
+            *settings = pending;
         }
         Ok(self.get_settings_view(launch_at_login_active))
     }
@@ -237,8 +257,12 @@ impl Manager {
         self.settings.lock().auto_start_nodes
     }
 
-    pub fn test_ilatency_session(&self) -> Result<String, String> {
-        let cookie = self.settings.lock().ilatency_cookie.clone();
+    pub fn test_ilatency_session(&self, candidate: Option<&str>) -> Result<String, String> {
+        // A failed test must never overwrite a previously working Cookie.
+        let cookie = candidate
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.settings.lock().ilatency_cookie.clone());
         ilatency::session_username(&cookie)
     }
 
@@ -257,9 +281,8 @@ impl Manager {
             defaults
         };
 
-        // Previous app sessions / crashed starts can leave anytls-client orphans
-        // holding local SOCKS ports — free them before anything starts.
-        self.kill_stale_anytls_clients();
+        // Only reclaim listeners on configured node ports after verifying the
+        // exact executable path. Never blanket-pkill matching user processes.
         let kernel = self.kernel_path();
         for n in &nodes {
             if !port_is_free(n.local_port) {
@@ -279,20 +302,6 @@ impl Manager {
         drop(logs);
         *self.nodes.lock() = nodes;
         Ok(())
-    }
-
-    fn kill_stale_anytls_clients(&self) {
-        let kernel = self.kernel_path();
-        let path = kernel.to_string_lossy();
-        if path.is_empty() {
-            return;
-        }
-        // Match our bundled binary path so we don't kill unrelated processes.
-        let _ = Command::new("pkill")
-            .args(["-9", "-f", path.as_ref()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
     }
 
     /// Kill managed child + recorded pid, and free the local SOCKS port if needed.
@@ -450,7 +459,7 @@ impl Manager {
     fn append_log(&self, id: &str, line: impl AsRef<str>) {
         let entry = LogEntry {
             ts: now_iso(),
-            line: line.as_ref().trim_end().to_string(),
+            line: line.as_ref().trim_end().chars().take(4096).collect(),
         };
         // Always print to terminal in dev so `npm run dev` shows selection progress.
         eprintln!("[socks-node:{id}] {}", entry.line);
@@ -464,16 +473,32 @@ impl Manager {
         }
         // Persist for later inspection (UI + after restart).
         let log_path = self.instances_dir.join(id).join("runtime.log");
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
         {
-            use std::io::Write;
-            let _ = writeln!(f, "{} {}", entry.ts, entry.line);
+            let _io = self.log_io.lock();
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::metadata(&log_path)
+                .is_ok_and(|meta| meta.len() >= 2 * 1024 * 1024)
+            {
+                let _ = std::fs::rename(&log_path, log_path.with_extension("log.1"));
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            if let Ok(mut file) = options.open(&log_path) {
+                use std::io::Write;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+                }
+                let _ = writeln!(file, "{} {}", entry.ts, entry.line);
+            }
         }
         if let Some(app) = self.app.lock().as_ref() {
             let _ = app.emit(
@@ -525,13 +550,13 @@ impl Manager {
             return Err(format!("本地端口 {} 已被其他节点使用", input.local_port));
         }
 
+        let requested_type = input.proxy_type.trim();
+        if !requested_type.is_empty() && !requested_type.eq_ignore_ascii_case("anytls") {
+            return Err("当前仅支持 AnyTLS 代理协议".into());
+        }
         Ok(NodeInput {
             name,
-            proxy_type: if input.proxy_type.trim().is_empty() {
-                "anytls".into()
-            } else {
-                input.proxy_type.trim().to_string()
-            },
+            proxy_type: "anytls".into(),
             server,
             port: input.port,
             password,
@@ -580,18 +605,27 @@ impl Manager {
             running: false,
         };
         node.refresh_public_fields();
-        self.logs.lock().insert(node.id.clone(), Vec::new());
         {
             let mut nodes = self.nodes.lock();
-            nodes.insert(0, node);
+            // Recheck under the mutation lock: two concurrent create requests
+            // might have passed the earlier normalized-input port check.
+            if nodes.iter().any(|n| n.local_port == node.local_port) {
+                return Err(format!("本地端口 {} 已被其他节点使用", node.local_port));
+            }
+            let mut next = nodes.clone();
+            next.insert(0, node.clone());
+            self.persist_nodes(&next)?;
+            *nodes = next;
         }
-        self.persist()?;
+        self.logs.lock().insert(node.id.clone(), Vec::new());
         self.emit_nodes();
         Ok(self.list())
     }
 
     pub fn update(&self, id: &str, patch: NodeInput) -> Result<Vec<ProxyNode>, String> {
-        // Validate before touching a live process. Invalid edits must not cause downtime.
+        // Serialize validation, stop and mutation with all other transitions.
+        let gate = self.lifecycle_gate(id);
+        let transition = gate.lock();
         let data = self.normalize_input(&patch, Some(id))?;
         let (was_running, was_starting) = {
             let nodes = self.nodes.lock();
@@ -602,11 +636,12 @@ impl Manager {
             )
         };
         if was_running || was_starting {
-            self.stop(id, true)?;
+            self.stop_locked(id, true)?;
         }
         {
             let mut nodes = self.nodes.lock();
-            let node = nodes.iter_mut().find(|n| n.id == id).ok_or("节点不存在")?;
+            let mut next = nodes.clone();
+            let node = next.iter_mut().find(|n| n.id == id).ok_or("节点不存在")?;
             // Drop sticky IP only when the upstream identity changes.
             let upstream_changed =
                 node.server != data.server || node.port != data.port;
@@ -629,18 +664,22 @@ impl Manager {
             node.updated_at = Some(now_iso());
             node.last_error = None;
             node.refresh_public_fields();
+            self.persist_nodes(&next)?;
+            *nodes = next;
         }
-        self.persist()?;
-
+        self.emit_nodes();
+        let revision = self.generations.lock().get(id).copied().unwrap_or(0);
+        drop(transition);
         if was_running {
-            let _ = self.start(id, true);
-        } else {
-            self.emit_nodes();
+            // Do not undo a Stop that arrived after the edit.
+            self.start_expected(id, true, Some(revision), None)?;
         }
         Ok(self.list())
     }
 
     pub fn remove(&self, id: &str) -> Result<Vec<ProxyNode>, String> {
+        let gate = self.lifecycle_gate(id);
+        let _transition = gate.lock();
         let running = {
             let nodes = self.nodes.lock();
             nodes
@@ -650,15 +689,21 @@ impl Manager {
                 .ok_or_else(|| "节点不存在".to_string())?
         };
         if running {
-            let _ = self.stop(id, true);
+            self.stop_locked(id, true)?;
+        } else {
+            // Invalidate queued transitions even when the node is already stopped.
+            self.bump_generation(id);
         }
         {
             let mut nodes = self.nodes.lock();
-            nodes.retain(|n| n.id != id);
+            let next: Vec<_> = nodes.iter().filter(|n| n.id != id).cloned().collect();
+            self.persist_nodes(&next)?;
+            *nodes = next;
         }
         self.logs.lock().remove(id);
         self.generations.lock().remove(id);
-        self.persist()?;
+        self.last_failover_at.lock().remove(id);
+        self.lifecycle_gates.lock().remove(id);
         let dir = self.instances_dir.join(id);
         let _ = std::fs::remove_dir_all(dir);
         self.emit_nodes();
@@ -691,6 +736,16 @@ impl Manager {
     }
 
     pub fn start(&self, id: &str, silent: bool) -> Result<Vec<ProxyNode>, String> {
+        self.start_expected(id, silent, None, None)
+    }
+
+    fn start_expected(
+        &self,
+        id: &str,
+        silent: bool,
+        expected_generation: Option<u64>,
+        expected_batch: Option<u64>,
+    ) -> Result<Vec<ProxyNode>, String> {
         let status = {
             let nodes = self.nodes.lock();
             nodes.iter().find(|n| n.id == id).ok_or("节点不存在")?.status.clone()
@@ -713,6 +768,19 @@ impl Manager {
         // Allocate a new generation while holding the Stop transition gate.
         let transition_gate = self.lifecycle_gate(id);
         let _transition = transition_gate.lock();
+        if *self.is_shutting_down.lock() {
+            return self.cancelled_start(silent);
+        }
+        if let Some(expected) = expected_generation {
+            if self.generations.lock().get(id).copied().unwrap_or(0) != expected {
+                return self.cancelled_start(silent);
+            }
+        }
+        if let Some(expected) = expected_batch {
+            if self.batch_generation.load(Ordering::Acquire) != expected {
+                return self.cancelled_start(silent);
+            }
+        }
         let generation = self.bump_generation(id);
 
         let kernel = self.kernel_path();
@@ -778,7 +846,7 @@ impl Manager {
         let listen = node_snapshot.listen_addr();
         // Allow Stop to cancel a potentially slow DNS / speed-selection phase.
         drop(_transition);
-        let selected = self.select_upstream_ip(&node_snapshot);
+        let selected = self.select_upstream_ip(&node_snapshot, generation);
         let _transition = transition_gate.lock();
         if !self.generation_is_current(id, generation) {
             return self.cancelled_start(silent);
@@ -830,6 +898,9 @@ impl Manager {
         ];
         if node_snapshot.skip_cert_verify {
             args.push("-insecure".into());
+        }
+        if !node_snapshot.udp {
+            args.push("-udp=false".into());
         }
         args.extend(bind_args);
         let mut child = match Command::new(&kernel)
@@ -937,6 +1008,13 @@ impl Manager {
                 false
             }
         };
+
+        if still_alive && !wait_local_proxy_ready(local_port, Duration::from_secs(3)) {
+            if let Some(mut child) = self.processes.lock().remove(id) {
+                kill_child_process(&mut child);
+            }
+            return self.abort_start(id, "anytls-client 仍存活，但本地 SOCKS 未成功监听".into(), silent);
+        }
 
         if still_alive {
             {
@@ -1090,44 +1168,26 @@ impl Manager {
             .nodes
             .lock()
             .iter()
-            .filter(|n| n.enabled && n.status != NodeStatus::Running)
+            .filter(|n| n.enabled && !matches!(
+                n.status,
+                NodeStatus::Running | NodeStatus::Starting | NodeStatus::Stopping
+            ))
             .map(|n| n.id.clone())
             .collect();
         if ids.is_empty() {
             return Ok(self.list());
         }
 
-        // Surface "starting" immediately so UI updates before long IP select.
-        {
-            let mut nodes = self.nodes.lock();
-            for id in &ids {
-                if let Some(node) = nodes.iter_mut().find(|n| n.id == *id) {
-                    if node.status != NodeStatus::Running {
-                        node.status = NodeStatus::Starting;
-                        node.last_error = None;
-                        node.last_probe = Some(ProbeStatus {
-                            ok: true,
-                            ms: None,
-                            ip: node.active_ip.clone(),
-                            message: if node.prefer_fastest_ip {
-                                "排队/并行启动中…".into()
-                            } else {
-                                "并行启动中…".into()
-                            },
-                            at: now_iso(),
-                        });
-                    }
-                }
-            }
-        }
-        self.emit_nodes();
-
+        let batch_generation = self.batch_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        thread::scope(|scope| {
-            let errors = &errors;
-            for id in ids {
-                scope.spawn(move || {
-                    match self.start(&id, true) {
+        // At most three simultaneous node starts (each may launch several
+        // transient speed probes). Bound resources for large configurations.
+        for batch in ids.chunks(3) {
+            thread::scope(|scope| {
+                let errors = &errors;
+                for id in batch.iter().cloned() {
+                    scope.spawn(move || {
+                    match self.start_expected(&id, true, None, Some(batch_generation)) {
                         Ok(_) => {
                             let nodes = self.nodes.lock();
                             if let Some(n) = nodes.iter().find(|n| n.id == id) {
@@ -1153,9 +1213,10 @@ impl Manager {
                             errors.lock().push(format!("{name}: {e}"));
                         }
                     }
-                });
-            }
-        });
+                    });
+                }
+            });
+        }
 
         let errors = errors.into_inner();
         if !errors.is_empty() {
@@ -1165,6 +1226,8 @@ impl Manager {
     }
 
     pub fn stop_all(&self) -> Result<Vec<ProxyNode>, String> {
+        // Invalidate batch workers that have not entered their node's gate.
+        self.batch_generation.fetch_add(1, Ordering::AcqRel);
         let ids: Vec<String> = self
             .nodes
             .lock()
@@ -1176,13 +1239,15 @@ impl Manager {
             return Ok(self.list());
         }
 
-        thread::scope(|scope| {
-            for id in ids {
-                scope.spawn(move || {
-                    let _ = self.stop(&id, true);
-                });
-            }
-        });
+        for batch in ids.chunks(8) {
+            thread::scope(|scope| {
+                for id in batch {
+                    scope.spawn(move || {
+                        let _ = self.stop(id, true);
+                    });
+                }
+            });
+        }
         Ok(self.list())
     }
 
@@ -1306,6 +1371,13 @@ impl Manager {
     pub fn shutdown(&self) {
         *self.is_shutting_down.lock() = true;
         let _ = self.stop_all();
+        // Defensive last resort: process tracking and UI status can diverge
+        // after an unexpected kernel or OS error. Never leave managed children
+        // alive just because a node was marked Error instead of Running.
+        let children = std::mem::take(&mut *self.processes.lock());
+        for (_, mut child) in children {
+            kill_child_process(&mut child);
+        }
     }
 
     pub fn status_summary(&self) -> (usize, usize) {
@@ -1366,11 +1438,50 @@ impl Manager {
         Ok(ip)
     }
 
+    /// Publish a provisional selection only if it still belongs to this
+    /// exact starting generation. DNS / bandwidth probes run without the
+    /// transition gate, so a user may stop or edit the node mid-probe.
+    fn publish_selection(
+        &self,
+        node: &ProxyNode,
+        generation: u64,
+        active_ip: Option<Option<String>>,
+        probe: Option<ProbeStatus>,
+    ) {
+        let gate = self.lifecycle_gate(&node.id);
+        let _transition = gate.lock();
+        if !self.generation_is_current(&node.id, generation) {
+            return;
+        }
+        let changed = active_ip.is_some();
+        {
+            let mut nodes = self.nodes.lock();
+            let Some(current) = nodes.iter_mut().find(|n| n.id == node.id) else {
+                return;
+            };
+            if current.status != NodeStatus::Starting
+                || current.server != node.server
+                || current.port != node.port
+            {
+                return;
+            }
+            if let Some(ip) = active_ip {
+                current.active_ip = ip;
+            }
+            if let Some(probe) = probe {
+                current.last_probe = Some(probe);
+            }
+        }
+        if changed {
+            let _ = self.persist();
+        }
+    }
+
     /// Choose upstream host as a concrete IP whenever possible.
     /// - Plain IP → as-is
     /// - Domain + preferFastestIp → multi-source + tcping + speed
     /// - Domain without preferFastestIp → physical DoH resolve (never pass domain to anytls)
-    fn select_upstream_ip(&self, node: &ProxyNode) -> Result<String, String> {
+    fn select_upstream_ip(&self, node: &ProxyNode, generation: u64) -> Result<String, String> {
         let server = node.server.trim();
         if server.is_empty() {
             return Err("服务器地址为空".into());
@@ -1383,18 +1494,13 @@ impl Manager {
             // and get Surge/Clash fake-ip (198.18.x), then fail to connect.
             match self.resolve_domain_safe(server, node.port, &node.id) {
                 Ok(ip) => {
-                    {
-                        let mut nodes = self.nodes.lock();
-                        if let Some(n) = nodes.iter_mut().find(|n| n.id == node.id) {
-                            n.last_probe = Some(ProbeStatus {
+                    self.publish_selection(node, generation, None, Some(ProbeStatus {
                                 ok: true,
                                 ms: None,
                                 ip: Some(ip.clone()),
                                 message: format!("DNS 直连解析 {ip}"),
                                 at: now_iso(),
-                            });
-                        }
-                    }
+                    }));
                     Ok(ip)
                 }
                 Err(e) => {
@@ -1426,32 +1532,20 @@ impl Manager {
                             "reuse sticky IP {sticky} ({ms}ms, alive — skip DNS/speed re-test)"
                         ),
                     );
-                    {
-                        let mut nodes = self.nodes.lock();
-                        if let Some(n) = nodes.iter_mut().find(|n| n.id == node.id) {
-                            n.active_ip = Some(sticky.clone());
-                            n.last_probe = Some(ProbeStatus {
+                    self.publish_selection(node, generation, Some(Some(sticky.clone())), Some(ProbeStatus {
                                 ok: true,
                                 ms: Some(ms),
                                 ip: Some(sticky.clone()),
                                 message: format!("沿用 {sticky} · {ms}ms · 跳过重测"),
                                 at: now_iso(),
-                            });
-                        }
-                    }
-                    let _ = self.persist();
+                    }));
                     return Ok(sticky);
                 }
                 self.append_log(
                     &node.id,
                     format!("sticky IP {sticky} dead — full re-select"),
                 );
-                {
-                    let mut nodes = self.nodes.lock();
-                    if let Some(n) = nodes.iter_mut().find(|n| n.id == node.id) {
-                        n.active_ip = None;
-                    }
-                }
+                self.publish_selection(node, generation, Some(None), None);
             }
 
             self.append_log(
@@ -1469,20 +1563,13 @@ impl Manager {
                         &node.id,
                         format!("selected upstream IP {ip} ({ms}ms{speed_part})"),
                     );
-                    {
-                        let mut nodes = self.nodes.lock();
-                        if let Some(n) = nodes.iter_mut().find(|n| n.id == node.id) {
-                            n.active_ip = Some(ip.clone());
-                            n.last_probe = Some(ProbeStatus {
+                    self.publish_selection(node, generation, Some(Some(ip.clone())), Some(ProbeStatus {
                                 ok: true,
                                 ms: Some(ms),
                                 ip: Some(ip.clone()),
                                 message: format!("优选 {ip} · {ms}ms{speed_part}"),
                                 at: now_iso(),
-                            });
-                        }
-                    }
-                    let _ = self.persist();
+                    }));
                     Ok(ip)
                 }
                 Err(err) => {
@@ -1508,20 +1595,13 @@ impl Manager {
                             &node.id,
                             format!("selected upstream IP {ip} ({ms}ms, latency-only fallback)"),
                         );
-                        {
-                            let mut nodes = self.nodes.lock();
-                            if let Some(n) = nodes.iter_mut().find(|n| n.id == node.id) {
-                                n.active_ip = Some(ip.clone());
-                                n.last_probe = Some(ProbeStatus {
+                        self.publish_selection(node, generation, Some(Some(ip.clone())), Some(ProbeStatus {
                                     ok: true,
                                     ms: Some(ms),
                                     ip: Some(ip.clone()),
                                     message: format!("优选 {ip} · {ms}ms · 仅延迟"),
                                     at: now_iso(),
-                                });
-                            }
-                        }
-                        let _ = self.persist();
+                        }));
                         Ok(ip)
                     } else {
                         // Never pass bare domain to anytls (Surge fake-ip).
@@ -1539,6 +1619,9 @@ impl Manager {
     fn collect_candidate_ips(&self, host: &str, port: u16, node_id: &str) -> Vec<String> {
         let mut sets: Vec<Vec<String>> = Vec::new();
         let host_key = host.trim().to_ascii_lowercase();
+        // Expired entries must actually be evicted; otherwise every new hostname
+        // permanently consumes memory over the lifetime of the menu-bar app.
+        self.dns_cache.lock().retain(|_, (at, _)| at.elapsed() < Duration::from_secs(8 * 60));
 
         // Short-lived multi-source cache (avoid repeat iLatency cost within a few minutes).
         if let Some((at, ips)) = self.dns_cache.lock().get(&host_key).cloned() {
@@ -1773,12 +1856,14 @@ impl Manager {
         let nodes = Arc::clone(&self.nodes);
         let processes = Arc::clone(&self.processes);
         let logs = Arc::clone(&self.logs);
+        let log_io = Arc::clone(&self.log_io);
         let settings = Arc::clone(&self.settings);
         let last_failover_at = Arc::clone(&self.last_failover_at);
         let dns_cache = Arc::clone(&self.dns_cache);
         let starting_ids = Arc::clone(&self.starting_ids);
         let generations = Arc::clone(&self.generations);
         let lifecycle_gates = Arc::clone(&self.lifecycle_gates);
+        let batch_generation = Arc::clone(&self.batch_generation);
         let shutting = Arc::clone(&self.is_shutting_down);
         let app = self.app.lock().clone();
         // Manager methods need self — re-enter via a lightweight helper object.
@@ -1798,6 +1883,7 @@ impl Manager {
                 nodes: Arc::clone(&nodes),
                 processes: Arc::clone(&processes),
                 logs: Arc::clone(&logs),
+                log_io: Arc::clone(&log_io),
                 settings: Arc::clone(&settings),
                 last_failover_at: Arc::clone(&last_failover_at),
                 dns_cache: Arc::clone(&dns_cache),
@@ -1805,6 +1891,7 @@ impl Manager {
                 is_shutting_down: Arc::clone(&shutting),
                 generations: Arc::clone(&generations),
                 lifecycle_gates: Arc::clone(&lifecycle_gates),
+                batch_generation: Arc::clone(&batch_generation),
                 app: Mutex::new(app.clone()),
             };
 
@@ -2017,6 +2104,8 @@ impl Manager {
     /// - Running node: clear sticky, re-run full DNS→tcping→speed, restart if changed.
     /// - Stopped node: clear sticky so next start does a fresh full select.
     pub fn reselect_upstream(&self, id: &str) -> Result<(), String> {
+        let gate = self.lifecycle_gate(id);
+        let transition = gate.lock();
         let node = {
             let nodes = self.nodes.lock();
             nodes
@@ -2033,9 +2122,12 @@ impl Manager {
         }
 
         if node.status == NodeStatus::Running {
-            // Full pipeline already implemented in failover_upstream (re-resolve +
-            // tcping + speed + restart-if-changed). Single owner for re-selection.
+            drop(transition);
+            // Full pipeline already implemented in failover_upstream.
             return self.failover_upstream(id);
+        }
+        if matches!(node.status, NodeStatus::Starting | NodeStatus::Stopping) {
+            return Err("节点状态变化中，请稍后重试".into());
         }
 
         // Not running: drop sticky so the next start re-selects from scratch.
@@ -2075,6 +2167,9 @@ impl Manager {
 
         let transition_gate = self.lifecycle_gate(id);
         let _transition = transition_gate.lock();
+        if *self.is_shutting_down.lock() {
+            return self.cancelled_start(silent);
+        }
         if let Some(expected) = expected_generation {
             if self.generations.lock().get(id).copied().unwrap_or(0) != expected {
                 return self.cancelled_start(silent);
@@ -2164,6 +2259,9 @@ impl Manager {
         ];
         if node_snapshot.skip_cert_verify {
             args.push("-insecure".into());
+        }
+        if !node_snapshot.udp {
+            args.push("-udp=false".into());
         }
         args.extend(bind_args);
         let mut child = match Command::new(&kernel)
@@ -2271,6 +2369,13 @@ impl Manager {
             }
         };
 
+        if still_alive && !wait_local_proxy_ready(local_port, Duration::from_secs(3)) {
+            if let Some(mut child) = self.processes.lock().remove(id) {
+                kill_child_process(&mut child);
+            }
+            return self.abort_start(id, "anytls-client 仍存活，但本地 SOCKS 未成功监听".into(), silent);
+        }
+
         if still_alive {
             {
                 let mut nodes = self.nodes.lock();
@@ -2370,7 +2475,7 @@ impl Manager {
 fn push_log_line(logs: &SharedLogs, app: &Option<AppHandle>, id: &str, line: &str) {
     let entry = LogEntry {
         ts: now_iso(),
-        line: line.trim_end().to_string(),
+        line: line.trim_end().chars().take(4096).collect(),
     };
     eprintln!("[socks-node:{id}] {}", entry.line);
     {
@@ -2477,6 +2582,100 @@ mod tests {
             .unwrap();
         let id = nodes[0].id.clone();
         (manager, dir, id)
+    }
+
+    #[test]
+    fn shutdown_reaps_managed_children_even_on_error_status() {
+        let (manager, dir, id) = test_manager(true);
+        let child = Command::new("sleep")
+            .arg("20")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        manager.processes.lock().insert(id, child);
+        manager.nodes.lock()[0].status = NodeStatus::Error;
+        manager.shutdown();
+        assert!(manager.processes.lock().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shutdown_rejects_late_starts() {
+        let (manager, dir, id) = test_manager(true);
+        manager.shutdown();
+        assert!(manager.start(&id, false).is_err());
+        assert_eq!(manager.list()[0].status, NodeStatus::Stopped);
+        assert!(manager.processes.lock().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn queued_batch_start_is_cancelled_by_stop_all() {
+        let (manager, dir, id) = test_manager(true);
+        let old_batch = manager.batch_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        manager.stop_all().unwrap();
+        let state = manager.start_expected(&id, true, None, Some(old_batch)).unwrap();
+        assert_eq!(state[0].status, NodeStatus::Stopped);
+        assert!(manager.processes.lock().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn outdated_dns_selection_cannot_overwrite_a_stopped_node() {
+        let (manager, dir, id) = test_manager(true);
+        let previous = manager.bump_generation(&id);
+        manager.nodes.lock()[0].status = NodeStatus::Starting;
+        let snapshot = manager.list()[0].clone();
+        manager.stop(&id, true).unwrap();
+        manager.publish_selection(&snapshot, previous, Some(Some("8.8.8.8".into())), None);
+        assert!(manager.nodes.lock()[0].active_ip.is_none());
+        assert_eq!(manager.nodes.lock()[0].status, NodeStatus::Stopped);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn listening_port_proves_local_proxy_readiness() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(wait_local_proxy_ready(port, Duration::from_millis(200)));
+        drop(listener);
+        assert!(!wait_local_proxy_ready(port, Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn runtime_log_rotates_without_exposing_contents() {
+        let (manager, dir, id) = test_manager(false);
+        let path = manager.instance_dir(&id).unwrap().join("runtime.log");
+        std::fs::write(&path, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        manager.append_log(&id, "rotation sample");
+        assert!(path.with_extension("log.1").exists());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("rotation sample"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn untrusted_node_ids_cannot_escape_instance_directory() {
+        let (manager, dir, id) = test_manager(false);
+        let original = std::fs::read_to_string(&manager.store_path).unwrap();
+        let tampered = original.replace(&id, "../outside");
+        assert!(store_from_json(&tampered).is_err());
+        let duplicate = {
+            let mut value: serde_json::Value = serde_json::from_str(&original).unwrap();
+            let node = value["nodes"][0].clone();
+            value["nodes"].as_array_mut().unwrap().push(node);
+            serde_json::to_string(&value).unwrap()
+        };
+        assert!(store_from_json(&duplicate).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

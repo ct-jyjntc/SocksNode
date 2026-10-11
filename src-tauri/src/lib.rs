@@ -103,14 +103,22 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             "show" => show_main_window(app),
             "start_all" => {
                 if let Some(state) = app.try_state::<AppState>() {
-                    let _ = state.manager.start_all();
-                    rebuild_tray_tooltip(app, &state.manager);
+                    let manager = Arc::clone(&state.manager);
+                    let app_handle = app.clone();
+                    thread::spawn(move || {
+                        let _ = manager.start_all();
+                        rebuild_tray_tooltip(&app_handle, &manager);
+                    });
                 }
             }
             "stop_all" => {
                 if let Some(state) = app.try_state::<AppState>() {
-                    let _ = state.manager.stop_all();
-                    rebuild_tray_tooltip(app, &state.manager);
+                    let manager = Arc::clone(&state.manager);
+                    let app_handle = app.clone();
+                    thread::spawn(move || {
+                        let _ = manager.stop_all();
+                        rebuild_tray_tooltip(&app_handle, &manager);
+                    });
                 }
             }
             "quit" => {
@@ -321,9 +329,10 @@ async fn settings_update(
 #[tauri::command]
 async fn settings_test_ilatency(
     state: tauri::State<'_, AppState>,
+    cookie: Option<String>,
 ) -> Result<String, String> {
     let manager = Arc::clone(&state.manager);
-    tauri::async_runtime::spawn_blocking(move || manager.test_ilatency_session())
+    tauri::async_runtime::spawn_blocking(move || manager.test_ilatency_session(cookie.as_deref()))
         .await
         .map_err(|e| e.to_string())?
 }

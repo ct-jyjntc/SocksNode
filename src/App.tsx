@@ -196,6 +196,7 @@ export default function App() {
   );
 
   useEffect(() => {
+    let active = true;
     let unsubChanged = () => {};
     let unsubLog = () => {};
 
@@ -206,6 +207,7 @@ export default function App() {
           api.getInfo(),
           api.getSettings(),
         ]);
+        if (!active) return;
         setNodes(list);
         setInfo(appInfo);
         setSettings(appSettings);
@@ -221,9 +223,9 @@ export default function App() {
         setAutoStartNodes(Boolean(appSettings.autoStartNodes));
         if (list[0]) setSelectedId(list[0].id);
       } catch (err) {
-        notify(err instanceof Error ? err.message : "初始化失败", "danger");
+        if (active) notify(err instanceof Error ? err.message : "初始化失败", "danger");
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
     })();
 
@@ -241,6 +243,7 @@ export default function App() {
     });
 
     return () => {
+      active = false;
       unsubChanged();
       unsubLog();
     };
@@ -313,6 +316,7 @@ export default function App() {
       sni: node.sni,
       skipCertVerify: node.skipCertVerify,
       localPort: node.localPort,
+      enabled: node.enabled,
       preferFastestIp: node.preferFastestIp !== false,
       lanAccess: Boolean(node.lanAccess),
     });
@@ -387,13 +391,12 @@ export default function App() {
     try {
       setSettingsBusy(true);
       setSettingsBusyLabel("验证 iLatency 会话…");
-      if (cookieDraft.trim()) {
-        await api.updateSettings({ ilatencyCookie: cookieDraft.trim() });
-      }
-      const user = await api.testIlatency();
-      const s = await api.getSettings();
-      setSettings(s);
-      notify(`iLatency 已登录：${user}`, "success");
+      const candidate = cookieDraft.trim();
+      const user = await api.testIlatency(candidate || undefined);
+      notify(
+        candidate ? "验证成功：" + user + " · 点击保存以应用新 Cookie" : "iLatency 已登录：" + user,
+        "success",
+      );
     } catch (err) {
       notify(err instanceof Error ? err.message : "iLatency 会话无效", "danger");
     } finally {
@@ -764,7 +767,10 @@ export default function App() {
                   <button
                     key={node.id}
                     type="button"
-                    onClick={() => setSelectedId(node.id)}
+                    onClick={() => {
+                      selectedIdRef.current = node.id;
+                      setSelectedId(node.id);
+                    }}
                     className={cn(
                       "flex w-full items-start gap-2.5 px-3 py-2.5 text-left transition-colors",
                       "hover:bg-secondary/50",
@@ -1050,10 +1056,12 @@ export default function App() {
                     className="h-6 px-2"
                     onClick={async () => {
                       if (!selectedId) return;
+                      const id = selectedId;
                       try {
-                        setLogs(await api.logs(selectedId));
+                        const entries = await api.logs(id);
+                        if (selectedIdRef.current === id) setLogs(entries);
                       } catch {
-                        setLogs([]);
+                        if (selectedIdRef.current === id) setLogs([]);
                       }
                     }}
                   >
@@ -1125,10 +1133,7 @@ export default function App() {
             />
           </Field>
           <Field label="协议类型">
-            <Input
-              value={form.type || "anytls"}
-              onChange={(e) => setForm((f) => ({ ...f, type: e.target.value }))}
-            />
+            <Input value="anytls" readOnly aria-readonly />
           </Field>
           <Field label="服务器">
             <Input
@@ -1148,6 +1153,8 @@ export default function App() {
           </Field>
           <Field label="密码">
             <Input
+              type="password"
+              autoComplete="off"
               value={form.password}
               onChange={(e) =>
                 setForm((f) => ({ ...f, password: e.target.value }))
@@ -1170,6 +1177,12 @@ export default function App() {
             />
           </Field>
           <div className="flex flex-col justify-end gap-2 pb-1">
+            <Checkbox
+              id="enabled"
+              label="参与全部启动和开机自动启动"
+              checked={form.enabled !== false}
+              onCheckedChange={(v) => setForm((f) => ({ ...f, enabled: v }))}
+            />
             <Checkbox
               id="udp"
               label="启用 UDP"
@@ -1274,6 +1287,8 @@ export default function App() {
           </div>
           <Field label="iLatency Cookie">
             <Input
+              type="password"
+              autoComplete="off"
               value={cookieDraft}
               onChange={(e) => setCookieDraft(e.target.value)}
               placeholder={

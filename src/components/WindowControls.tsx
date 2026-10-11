@@ -13,16 +13,24 @@ export function WindowControls({ className }: { className?: string }) {
   useEffect(() => {
     const win = getCurrentWindow();
     let unlisten: (() => void) | undefined;
-    void win.isMaximized().then(setMaximized).catch(() => {});
+    let active = true;
+    const updateMaximized = () => {
+      void win.isMaximized()
+        .then((value) => {
+          if (active) setMaximized(value);
+        })
+        .catch(() => {});
+    };
+    updateMaximized();
     void win
-      .onResized(() => {
-        void win.isMaximized().then(setMaximized).catch(() => {});
-      })
+      .onResized(updateMaximized)
       .then((fn) => {
-        unlisten = fn;
+        if (active) unlisten = fn;
+        else fn();
       })
       .catch(() => {});
     return () => {
+      active = false;
       unlisten?.();
     };
   }, []);
