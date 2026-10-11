@@ -27,6 +27,7 @@ type SharedProcs = Arc<Mutex<HashMap<String, Child>>>;
 type SharedNodes = Arc<Mutex<Vec<ProxyNode>>>;
 type SharedSettings = Arc<Mutex<AppSettings>>;
 type SharedFailoverAt = Arc<Mutex<HashMap<String, Instant>>>;
+type SharedGenerations = Arc<Mutex<HashMap<String, u64>>>;
 type SharedDnsCache = Arc<Mutex<HashMap<String, (Instant, Vec<String>)>>>;
 
 const TCPING_TIMEOUT: Duration = Duration::from_secs(2);
@@ -61,12 +62,41 @@ fn port_is_free(port: u16) -> bool {
         && TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
-/// Kill whatever is LISTENing on the local SOCKS port (app-private ports).
-fn kill_listeners_on_port(port: u16) {
+/// True only when pid is one of our bundled anytls-client processes.
+///
+/// Every forced kill goes through this guard: the local SOCKS ports are
+/// user-configurable, so we must never kill an unrelated service that
+/// happens to listen on the same port.
+fn pid_is_our_kernel(pid: u32, kernel: &std::path::Path) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let kernel = kernel.to_string_lossy();
+    if kernel.trim().is_empty() {
+        return false;
+    }
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).contains(kernel.as_ref())
+        }
+        _ => false,
+    }
+}
+
+/// Kill LISTENers on port only if they are our own anytls-client.
+/// Foreign listeners are left alone; callers surface a port-conflict error.
+fn kill_owned_listeners_on_port(port: u16, kernel: &std::path::Path) {
+    let port = port.to_string();
+    let tcp_filter = ["-iTCP:", &port].concat();
     let output = Command::new("lsof")
         .args([
             "-nP",
-            &format!("-iTCP:{port}"),
+            tcp_filter.as_str(),
             "-sTCP:LISTEN",
             "-t",
         ])
@@ -78,7 +108,9 @@ fn kill_listeners_on_port(port: u16) {
     };
     for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
         if let Ok(p) = pid.parse::<u32>() {
-            force_kill_pid(p);
+            if pid_is_our_kernel(p, kernel) {
+                force_kill_pid(p);
+            }
         }
     }
 }
@@ -102,6 +134,9 @@ pub struct Manager {
     dns_cache: SharedDnsCache,
     /// Node ids currently inside `start()` — blocks double-start races.
     starting_ids: Arc<Mutex<HashSet<String>>>,
+    /// Per-node watcher generation; bumped on every start/stop so stale
+    /// health/exit watchers terminate instead of piling up.
+    generations: SharedGenerations,
     is_shutting_down: Arc<Mutex<bool>>,
     app: Mutex<Option<AppHandle>>,
 }
@@ -123,6 +158,7 @@ impl Manager {
             last_failover_at: Arc::new(Mutex::new(HashMap::new())),
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
             starting_ids: Arc::new(Mutex::new(HashSet::new())),
+            generations: Arc::new(Mutex::new(HashMap::new())),
             is_shutting_down: Arc::new(Mutex::new(false)),
             app: Mutex::new(None),
         }
@@ -161,7 +197,7 @@ impl Manager {
                 settings.speed_top_k = v.clamp(1, 8);
             }
             if let Some(v) = patch.speed_test_bytes {
-                settings.speed_test_bytes = v.clamp(1024 * 1024, 100 * 1024 * 1024);
+                settings.speed_test_bytes = v.clamp(1024 * 1024, 50 * 1024 * 1024);
             }
             if let Some(v) = patch.speed_test_timeout_secs {
                 settings.speed_test_timeout_secs = v.clamp(10, 60);
@@ -169,8 +205,15 @@ impl Manager {
             if let Some(v) = patch.launch_at_login {
                 settings.launch_at_login = v;
             }
+            if let Some(v) = patch.start_minimized {
+                settings.start_minimized = v;
+            }
             if let Some(v) = patch.auto_start_nodes {
                 settings.auto_start_nodes = v;
+            }
+            // Minimized login start only makes sense with launch-at-login.
+            if !settings.launch_at_login {
+                settings.start_minimized = false;
             }
             settings.save(&self.data_dir)?;
         }
@@ -179,6 +222,11 @@ impl Manager {
 
     pub fn launch_at_login_setting(&self) -> bool {
         self.settings.lock().launch_at_login
+    }
+
+    pub fn start_minimized_setting(&self) -> bool {
+        let s = self.settings.lock();
+        s.launch_at_login && s.start_minimized
     }
 
     pub fn auto_start_nodes_setting(&self) -> bool {
@@ -208,9 +256,10 @@ impl Manager {
         // Previous app sessions / crashed starts can leave anytls-client orphans
         // holding local SOCKS ports — free them before anything starts.
         self.kill_stale_anytls_clients();
+        let kernel = self.kernel_path();
         for n in &nodes {
             if !port_is_free(n.local_port) {
-                kill_listeners_on_port(n.local_port);
+                kill_owned_listeners_on_port(n.local_port, &kernel);
             }
         }
         thread::sleep(Duration::from_millis(80));
@@ -247,15 +296,18 @@ impl Manager {
         if let Some(mut child) = self.processes.lock().remove(id) {
             kill_child_process(&mut child);
         }
+        let kernel = self.kernel_path();
         let pid = {
             let nodes = self.nodes.lock();
             nodes.iter().find(|n| n.id == id).and_then(|n| n.pid)
         };
         if let Some(pid) = pid {
-            force_kill_pid(pid);
+            if pid_is_our_kernel(pid, &kernel) {
+                force_kill_pid(pid);
+            }
         }
         if !port_is_free(local_port) {
-            kill_listeners_on_port(local_port);
+            kill_owned_listeners_on_port(local_port, &kernel);
             // TIME_WAIT / kernel release
             for _ in 0..10 {
                 thread::sleep(Duration::from_millis(40));
@@ -264,6 +316,35 @@ impl Manager {
                 }
             }
         }
+    }
+
+    /// Turn a failed start into a visible Error state instead of leaving the
+    /// node stuck in `Starting` forever.
+    fn abort_start(&self, id: &str, msg: String, silent: bool) -> Result<Vec<ProxyNode>, String> {
+        {
+            let mut nodes = self.nodes.lock();
+            if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
+                node.status = NodeStatus::Error;
+                node.pid = None;
+                node.last_error = Some(msg.clone());
+            }
+        }
+        self.append_log(id, "start failed");
+        self.append_log(id, &msg);
+        self.emit_nodes();
+        if silent {
+            Ok(self.list())
+        } else {
+            Err(msg)
+        }
+    }
+
+    /// Invalidate every watcher previously spawned for this node.
+    fn bump_generation(&self, id: &str) -> u64 {
+        let mut map = self.generations.lock();
+        let entry = map.entry(id.to_string()).or_insert(0);
+        *entry = entry.wrapping_add(1);
+        *entry
     }
 
     fn begin_start_guard(&self, id: &str) -> Option<StartGuard> {
@@ -279,7 +360,17 @@ impl Manager {
 
     fn persist_nodes(&self, nodes: &[ProxyNode]) -> Result<(), String> {
         let json = store_to_json(nodes).map_err(|e| e.to_string())?;
-        std::fs::write(&self.store_path, json).map_err(|e| e.to_string())
+        std::fs::write(&self.store_path, json).map_err(|e| e.to_string())?;
+        // nodes.json holds upstream passwords; keep it private to the user.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &self.store_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        Ok(())
     }
 
     fn persist(&self) -> Result<(), String> {
@@ -322,7 +413,7 @@ impl Manager {
     pub fn get_info(&self, version: &str) -> AppInfo {
         AppInfo {
             data_dir: self.data_dir.display().to_string(),
-            mihomo_path: self.kernel_path().display().to_string(),
+            kernel_path: self.kernel_path().display().to_string(),
             version: version.to_string(),
         }
     }
@@ -547,6 +638,7 @@ impl Manager {
             nodes.retain(|n| n.id != id);
         }
         self.logs.lock().remove(id);
+        self.generations.lock().remove(id);
         self.persist()?;
         let dir = self.instances_dir.join(id);
         let _ = std::fs::remove_dir_all(dir);
@@ -602,9 +694,12 @@ impl Manager {
             }
         };
 
+        // Invalidate watchers from a previous run of this node.
+        let generation = self.bump_generation(id);
+
         let kernel = self.kernel_path();
         if !kernel.exists() {
-            return Err(format!("找不到 anytls 内核: {}", kernel.display()));
+            return self.abort_start(id, ["找不到 anytls 内核: ", kernel.display().to_string().as_str()].concat(), silent);
         }
 
         let (local_port, name_for_log) = {
@@ -619,9 +714,9 @@ impl Manager {
 
         if let Err(e) = self.assert_port_available(local_port, id) {
             // One more aggressive reclaim then recheck.
-            kill_listeners_on_port(local_port);
+            kill_owned_listeners_on_port(local_port, &kernel);
             thread::sleep(Duration::from_millis(100));
-            self.assert_port_available(local_port, id).map_err(|_| e)?;
+            return self.abort_start(id, e, silent);
         }
 
         {
@@ -658,9 +753,15 @@ impl Manager {
                 .ok_or("节点不存在")?
         };
 
-        let dir = self.instance_dir(&node_snapshot.id)?;
+        let dir = match self.instance_dir(&node_snapshot.id) {
+            Ok(dir) => dir,
+            Err(e) => return self.abort_start(id, e, silent),
+        };
         let listen = node_snapshot.listen_addr();
-        let upstream_host = self.select_upstream_ip(&node_snapshot)?;
+        let upstream_host = match self.select_upstream_ip(&node_snapshot) {
+            Ok(ip) => ip,
+            Err(e) => return self.abort_start(id, ["IP 优选失败: ", e.as_str()].concat(), silent),
+        };
         {
             let mut nodes = self.nodes.lock();
             if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
@@ -699,20 +800,25 @@ impl Manager {
             listen.clone(),
             "-s".into(),
             server.clone(),
-            "-p".into(),
-            node_snapshot.password.clone(),
             "-sni".into(),
             sni.clone(),
         ];
+        if node_snapshot.skip_cert_verify {
+            args.push("-insecure".into());
+        }
         args.extend(bind_args);
-        let mut child = Command::new(&kernel)
+        let mut child = match Command::new(&kernel)
             .args(&args)
+            .env("SOCKSNODE_PASSWORD", &node_snapshot.password)
             .current_dir(&dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("启动 anytls-client 失败: {e}"))?;
+        {
+            Ok(child) => child,
+            Err(e) => return self.abort_start(id, e.to_string(), silent),
+        };
 
         let pid = child.id();
         {
@@ -730,8 +836,11 @@ impl Manager {
             let app_c = app_handle.clone();
             thread::spawn(move || {
                 let reader = BufReader::new(stdout);
-                for line in reader.lines().flatten() {
-                    push_log_line(&logs_c, &app_c, &id_c, &line);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => push_log_line(&logs_c, &app_c, &id_c, &line),
+                        Err(_) => break,
+                    }
                 }
             });
         }
@@ -741,8 +850,11 @@ impl Manager {
             let app_c = app_handle.clone();
             thread::spawn(move || {
                 let reader = BufReader::new(stderr);
-                for line in reader.lines().flatten() {
-                    push_log_line(&logs_c, &app_c, &id_c, &line);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => push_log_line(&logs_c, &app_c, &id_c, &line),
+                        Err(_) => break,
+                    }
                 }
             });
         }
@@ -833,7 +945,7 @@ impl Manager {
                 );
             }
             self.emit_nodes();
-            self.spawn_health_watch(id);
+            self.spawn_health_watch(id, generation);
         }
 
         // Background watcher for unexpected exits
@@ -843,9 +955,13 @@ impl Manager {
         let logs_w = Arc::clone(&self.logs);
         let shutting = Arc::clone(&self.is_shutting_down);
         let app_w = self.app.lock().clone();
+        let generations_w = Arc::clone(&self.generations);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(500));
             if *shutting.lock() {
+                break;
+            }
+            if generations_w.lock().get(&id_watch).copied().unwrap_or(0).ne(&generation) {
                 break;
             }
             let mut procs = processes_w.lock();
@@ -901,6 +1017,8 @@ impl Manager {
                 return Err("节点不存在".into());
             }
         }
+
+        self.bump_generation(id);
 
         let local_port = {
             let nodes = self.nodes.lock();
@@ -1490,9 +1608,10 @@ impl Manager {
             let s = self.settings.lock();
             (
                 s.select_strategy,
-                // Always consider a few more low-RTT candidates for multi-line domains.
-                s.speed_top_k.clamp(1, 8).max(3) as usize,
-                s.speed_test_bytes.clamp(1024 * 1024, 100 * 1024 * 1024),
+                // Honor the user's Top-K setting (1..8).
+                s.speed_top_k.clamp(1, 8) as usize,
+                // The bundled kernel only samples up to 50 MiB per candidate.
+                s.speed_test_bytes.clamp(1024 * 1024, 50 * 1024 * 1024),
                 Duration::from_secs(s.speed_test_timeout_secs.clamp(10, 60)),
             )
         };
@@ -1578,6 +1697,7 @@ impl Manager {
                 port,
                 &password,
                 &sni,
+                node.skip_cert_verify,
                 speed_bytes,
                 speed_timeout,
             )
@@ -1616,7 +1736,7 @@ impl Manager {
         Ok((best.ip, best.rtt_ms, best.mbps, detail))
     }
 
-    fn spawn_health_watch(&self, id: &str) {
+    fn spawn_health_watch(&self, id: &str, generation: u64) {
         let id = id.to_string();
         let nodes = Arc::clone(&self.nodes);
         let processes = Arc::clone(&self.processes);
@@ -1625,6 +1745,7 @@ impl Manager {
         let last_failover_at = Arc::clone(&self.last_failover_at);
         let dns_cache = Arc::clone(&self.dns_cache);
         let starting_ids = Arc::clone(&self.starting_ids);
+        let generations = Arc::clone(&self.generations);
         let shutting = Arc::clone(&self.is_shutting_down);
         let app = self.app.lock().clone();
         // Manager methods need self — re-enter via a lightweight helper object.
@@ -1649,6 +1770,7 @@ impl Manager {
                 dns_cache: Arc::clone(&dns_cache),
                 starting_ids: Arc::clone(&starting_ids),
                 is_shutting_down: Arc::clone(&shutting),
+                generations: Arc::clone(&generations),
                 app: Mutex::new(app.clone()),
             };
 
@@ -1659,6 +1781,9 @@ impl Manager {
                 };
                 thread::sleep(interval);
                 if *shutting.lock() {
+                    break;
+                }
+                if generations.lock().get(&id).copied().unwrap_or(0).ne(&generation) {
                     break;
                 }
 
@@ -1907,9 +2032,12 @@ impl Manager {
             }
         };
 
+        // Invalidate watchers from a previous run of this node.
+        let generation = self.bump_generation(id);
+
         let kernel = self.kernel_path();
         if !kernel.exists() {
-            return Err(format!("找不到 anytls 内核: {}", kernel.display()));
+            return self.abort_start(id, ["找不到 anytls 内核: ", kernel.display().to_string().as_str()].concat(), silent);
         }
 
         let (local_port, name_for_log) = {
@@ -1919,9 +2047,9 @@ impl Manager {
         };
         self.reclaim_node_runtime(id, local_port);
         if let Err(e) = self.assert_port_available(local_port, id) {
-            kill_listeners_on_port(local_port);
+            kill_owned_listeners_on_port(local_port, &kernel);
             thread::sleep(Duration::from_millis(100));
-            self.assert_port_available(local_port, id).map_err(|_| e)?;
+            return self.abort_start(id, e, silent);
         }
 
         {
@@ -1944,7 +2072,10 @@ impl Manager {
                 .ok_or("节点不存在")?
         };
 
-        let dir = self.instance_dir(&node_snapshot.id)?;
+        let dir = match self.instance_dir(&node_snapshot.id) {
+            Ok(dir) => dir,
+            Err(e) => return self.abort_start(id, e, silent),
+        };
         let listen = node_snapshot.listen_addr();
         let server = format!("{}:{}", upstream_host, node_snapshot.port);
         let sni = if node_snapshot.sni.is_empty() {
@@ -1974,20 +2105,25 @@ impl Manager {
             listen.clone(),
             "-s".into(),
             server.clone(),
-            "-p".into(),
-            node_snapshot.password.clone(),
             "-sni".into(),
             sni.clone(),
         ];
+        if node_snapshot.skip_cert_verify {
+            args.push("-insecure".into());
+        }
         args.extend(bind_args);
-        let mut child = Command::new(&kernel)
+        let mut child = match Command::new(&kernel)
             .args(&args)
+            .env("SOCKSNODE_PASSWORD", &node_snapshot.password)
             .current_dir(&dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("启动 anytls-client 失败: {e}"))?;
+        {
+            Ok(child) => child,
+            Err(e) => return self.abort_start(id, e.to_string(), silent),
+        };
 
         let pid = child.id();
         {
@@ -2005,8 +2141,11 @@ impl Manager {
             let app_c = app_handle.clone();
             thread::spawn(move || {
                 let reader = BufReader::new(stdout);
-                for line in reader.lines().flatten() {
-                    push_log_line(&logs_c, &app_c, &id_c, &line);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => push_log_line(&logs_c, &app_c, &id_c, &line),
+                        Err(_) => break,
+                    }
                 }
             });
         }
@@ -2016,8 +2155,11 @@ impl Manager {
             let app_c = app_handle.clone();
             thread::spawn(move || {
                 let reader = BufReader::new(stderr);
-                for line in reader.lines().flatten() {
-                    push_log_line(&logs_c, &app_c, &id_c, &line);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => push_log_line(&logs_c, &app_c, &id_c, &line),
+                        Err(_) => break,
+                    }
                 }
             });
         }
@@ -2108,7 +2250,7 @@ impl Manager {
                 );
             }
             self.emit_nodes();
-            self.spawn_health_watch(id);
+            self.spawn_health_watch(id, generation);
         }
 
         // exit watcher (same as start)
@@ -2118,9 +2260,13 @@ impl Manager {
         let logs_w = Arc::clone(&self.logs);
         let shutting = Arc::clone(&self.is_shutting_down);
         let app_w = self.app.lock().clone();
+        let generations_w = Arc::clone(&self.generations);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(500));
             if *shutting.lock() {
+                break;
+            }
+            if generations_w.lock().get(&id_watch).copied().unwrap_or(0).ne(&generation) {
                 break;
             }
             let mut procs = processes_w.lock();

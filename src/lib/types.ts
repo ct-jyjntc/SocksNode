@@ -64,7 +64,7 @@ export type NodeInput = {
 
 export type AppInfo = {
   dataDir: string;
-  mihomoPath: string;
+  kernelPath: string;
   version: string;
 };
 
@@ -81,6 +81,7 @@ export type AppSettingsView = {
   speedTestBytes: number;
   speedTestTimeoutSecs: number;
   launchAtLogin: boolean;
+  startMinimized: boolean;
   autoStartNodes: boolean;
   launchAtLoginActive: boolean;
 };
@@ -94,6 +95,7 @@ export type AppSettingsPatch = {
   speedTestBytes?: number;
   speedTestTimeoutSecs?: number;
   launchAtLogin?: boolean;
+  startMinimized?: boolean;
   autoStartNodes?: boolean;
 };
 

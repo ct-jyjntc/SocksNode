@@ -26,7 +26,11 @@ func main() {
 	disableReuse := flag.Bool("dr", false, "Disable client session reuse")
 	bindIP := flag.String("bind", "", "Outbound local IPv4 bind (physical NIC). Empty=auto-detect")
 	bindIF := flag.String("iface", "", "Outbound interface name for IP_BOUND_IF (macOS), e.g. en0")
+	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (unsafe)")
 	flag.Parse()
+	if *password == "" {
+		*password = os.Getenv("SOCKSNODE_PASSWORD")
+	}
 
 	if serverURL, err := url.Parse(*serverAddr); err == nil {
 		if serverURL.Scheme == "anytls" {
@@ -86,7 +90,7 @@ func main() {
 	// You can only use `InsecureSkipVerify` by default in the sample client; it is not recommended for use in production code.
 	tlsConfig := &tls.Config{
 		ServerName:         *sni,
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: *insecure,
 	}
 	if tlsConfig.ServerName == "" {
 		// disable the SNI

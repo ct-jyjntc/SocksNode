@@ -261,17 +261,22 @@ fn autostart_is_enabled(app: &AppHandle) -> bool {
     app.autolaunch().is_enabled().unwrap_or(false)
 }
 
+fn launched_via_login() -> bool {
+    std::env::args().any(|a| a == "--minimized")
+}
+
 fn apply_launch_at_login(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let launcher = app.autolaunch();
     let current = launcher.is_enabled().unwrap_or(false);
-    if enabled == current {
-        return Ok(());
-    }
     if enabled {
+        // Re-write LaunchAgent so `--minimized` args stay in sync.
+        if current {
+            let _ = launcher.disable();
+        }
         launcher
             .enable()
             .map_err(|e| format!("启用开机自启失败: {e}"))?;
-    } else {
+    } else if current {
         launcher
             .disable()
             .map_err(|e| format!("关闭开机自启失败: {e}"))?;
@@ -359,8 +364,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            // Keep CLI args empty so login launch behaves like a normal start.
-            Some(vec![]),
+            // Login item always passes this flag; we only honor it when
+            // startMinimized is on. Manual / Dock launches have no flag.
+            Some(vec!["--minimized".into()]),
         ))
         .setup(|app| {
             let (data_dir, resources_dir) = resolve_paths(app.handle());
@@ -378,6 +384,11 @@ pub fn run() {
             let want_login = manager.launch_at_login_setting();
             if let Err(e) = apply_launch_at_login(app.handle(), want_login) {
                 eprintln!("autostart sync: {e}");
+            }
+
+            // Login-item launch + setting on → stay in tray (no main window).
+            if launched_via_login() && manager.start_minimized_setting() {
+                hide_to_tray(app.handle());
             }
 
             // Optional: start all nodes shortly after launch so UI can mount first.

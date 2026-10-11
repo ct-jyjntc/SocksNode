@@ -118,7 +118,7 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {
     pub data_dir: String,
-    pub mihomo_path: String,
+    pub kernel_path: String,
     pub version: String,
 }
 
@@ -257,59 +257,10 @@ pub fn primary_lan_ipv4() -> Option<String> {
     }
 }
 
+/// No built-in nodes: the app never ships credentials or preset servers.
+/// Users add their own nodes on first run; nothing sensitive lives in the repo.
 pub fn default_nodes() -> Vec<ProxyNode> {
-    vec![
-        ProxyNode {
-            id: "hk-01".into(),
-            name: "香港".into(),
-            proxy_type: "anytls".into(),
-            server: "156.239.13.236".into(),
-            port: 12002,
-            password: "bfab1b89-b4db-44b8-a518-e13eb05f2cad".into(),
-            udp: true,
-            sni: "www.icloud.com".into(),
-            skip_cert_verify: true,
-            local_port: 5001,
-            enabled: true,
-            prefer_fastest_ip: true,
-            lan_access: false,
-            active_ip: None,
-            last_probe: None,
-            status: NodeStatus::Stopped,
-            pid: None,
-            last_error: None,
-            last_test: None,
-            updated_at: Some(now_iso()),
-            socks: "socks5://127.0.0.1:5001".into(),
-            lan_socks: None,
-            running: false,
-        },
-        ProxyNode {
-            id: "us-bgp".into(),
-            name: "美国".into(),
-            proxy_type: "anytls".into(),
-            server: "znjxdm.lajiaoyun.sbs".into(),
-            port: 50001,
-            password: "bfab1b89-b4db-44b8-a518-e13eb05f2cad".into(),
-            udp: true,
-            sni: "www.icloud.com".into(),
-            skip_cert_verify: true,
-            local_port: 5002,
-            enabled: true,
-            prefer_fastest_ip: true,
-            lan_access: false,
-            active_ip: None,
-            last_probe: None,
-            status: NodeStatus::Stopped,
-            pid: None,
-            last_error: None,
-            last_test: None,
-            updated_at: Some(now_iso()),
-            socks: "socks5://127.0.0.1:5002".into(),
-            lan_socks: None,
-            running: false,
-        },
-    ]
+    Vec::new()
 }
 
 pub fn now_iso() -> String {

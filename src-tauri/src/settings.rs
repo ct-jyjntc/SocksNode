@@ -29,6 +29,10 @@ pub struct AppSettings {
     /// Register app as a login item / autostart entry.
     #[serde(default)]
     pub launch_at_login: bool,
+    /// When launched by the login item, hide the window (tray only).
+    /// Ignored unless `launch_at_login` is on.
+    #[serde(default)]
+    pub start_minimized: bool,
     /// When the app launches, start all enabled nodes automatically.
     #[serde(default)]
     pub auto_start_nodes: bool,
@@ -63,6 +67,7 @@ impl Default for AppSettings {
             speed_test_bytes: default_speed_bytes(),
             speed_test_timeout_secs: default_speed_timeout(),
             launch_at_login: false,
+            start_minimized: false,
             auto_start_nodes: false,
         }
     }
@@ -81,6 +86,7 @@ pub struct AppSettingsView {
     pub speed_test_bytes: u64,
     pub speed_test_timeout_secs: u64,
     pub launch_at_login: bool,
+    pub start_minimized: bool,
     pub auto_start_nodes: bool,
     /// Actual OS autostart registration status (may differ if user changed system settings).
     pub launch_at_login_active: bool,
@@ -108,7 +114,14 @@ impl AppSettings {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, json).map_err(|e| e.to_string())
+        std::fs::write(&path, json).map_err(|e| e.to_string())?;
+        // The file holds the iLatency session cookie; keep it private to the user.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
     }
 
     pub fn to_view(&self, username: Option<String>, launch_at_login_active: bool) -> AppSettingsView {
@@ -128,9 +141,10 @@ impl AppSettings {
             ilatency_user: username,
             select_strategy: self.select_strategy.as_str().to_string(),
             speed_top_k: self.speed_top_k.clamp(1, 8),
-            speed_test_bytes: self.speed_test_bytes.clamp(1024 * 1024, 100 * 1024 * 1024),
+            speed_test_bytes: self.speed_test_bytes.clamp(1024 * 1024, 50 * 1024 * 1024),
             speed_test_timeout_secs: self.speed_test_timeout_secs.clamp(10, 60),
             launch_at_login: self.launch_at_login,
+            start_minimized: self.launch_at_login && self.start_minimized,
             auto_start_nodes: self.auto_start_nodes,
             launch_at_login_active,
         }
@@ -148,5 +162,6 @@ pub struct AppSettingsPatch {
     pub speed_test_bytes: Option<u64>,
     pub speed_test_timeout_secs: Option<u64>,
     pub launch_at_login: Option<bool>,
+    pub start_minimized: Option<bool>,
     pub auto_start_nodes: Option<bool>,
 }

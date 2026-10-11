@@ -104,12 +104,14 @@ fn kill_child(child: &mut Child) {
 }
 
 /// Start ephemeral anytls-client, download via SOCKS, return Mbps.
+#[allow(clippy::too_many_arguments)]
 pub fn measure_proxy_mbps(
     kernel: &Path,
     upstream_host: &str,
     upstream_port: u16,
     password: &str,
     sni: &str,
+    skip_cert_verify: bool,
     download_bytes: u64,
     overall_timeout: Duration,
 ) -> Result<f64, String> {
@@ -127,14 +129,16 @@ pub fn measure_proxy_mbps(
         listen.clone(),
         "-s".into(),
         server.clone(),
-        "-p".into(),
-        password.to_string(),
         "-sni".into(),
         sni.to_string(),
     ];
+    if skip_cert_verify {
+        args.push("-insecure".into());
+    }
     args.extend(crate::net_bind::anytls_bind_args());
     let mut child = Command::new(kernel)
         .args(&args)
+        .env("SOCKSNODE_PASSWORD", password)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

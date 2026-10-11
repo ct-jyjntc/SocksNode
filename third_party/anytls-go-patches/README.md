@@ -1,6 +1,6 @@
 # anytls-client UDP fix
 
-Bundled kernel: `anytls/0.0.13-socksnode1`
+Bundled kernel: `anytls/0.0.13-socksnode4`
 
 ## Problem
 
@@ -21,6 +21,21 @@ In `cmd/client/inbound.go` `NewPacketConnection`:
 1. Wait for the first UDP packet from the local SOCKS association
 2. Open the anytls UoT stream with that real destination
 3. Replay the first packet via `bufio.NewCachedPacketConn`
+
+## Other SocksNode patches
+
+`third_party/anytls-go/` is a fork snapshot of the kernel used to build the
+bundled binary. On top of the UDP fix it also adds:
+
+- `-insecure` (default `false`) — opt-in TLS certificate verification skip,
+  driven by the per-node `skipCertVerify` setting.
+- `-bind <ipv4>` / `-iface <name>` — force outbound dials onto a physical NIC
+  (see `proxy/system_dialer.go`), used to avoid Surge/Clash `utun` + fake-ip.
+- `SOCKSNODE_PASSWORD` env var — password fallback so it does not appear in
+  `argv` / `ps` output.
+
+Rebuild the vendored source with the command below to get a binary that
+matches `src-tauri/resources/anytls-client`.
 
 ## Rebuild
 

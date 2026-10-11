@@ -129,6 +129,7 @@ export default function App() {
   const [speedTopK, setSpeedTopK] = useState(3);
   const [speedTestMb, setSpeedTestMb] = useState(1);
   const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [startMinimized, setStartMinimized] = useState(false);
   const [autoStartNodes, setAutoStartNodes] = useState(false);
   const selectedIdRef = useRef<string | null>(null);
   const logEndRef = useRef<HTMLDivElement | null>(null);
@@ -216,6 +217,7 @@ export default function App() {
           Math.max(0.25, (appSettings.speedTestBytes || 1048576) / 1048576),
         );
         setLaunchAtLogin(Boolean(appSettings.launchAtLogin));
+        setStartMinimized(Boolean(appSettings.startMinimized));
         setAutoStartNodes(Boolean(appSettings.autoStartNodes));
         if (list[0]) setSelectedId(list[0].id);
       } catch (err) {
@@ -319,6 +321,7 @@ export default function App() {
       setSpeedTopK(s.speedTopK || 3);
       setSpeedTestMb(Math.max(0.25, (s.speedTestBytes || 1048576) / 1048576));
       setLaunchAtLogin(Boolean(s.launchAtLogin));
+      setStartMinimized(Boolean(s.startMinimized));
       setAutoStartNodes(Boolean(s.autoStartNodes));
       setSettingsOpen(true);
     } catch (err) {
@@ -341,6 +344,7 @@ export default function App() {
         speedTopK: number;
         speedTestBytes: number;
         launchAtLogin: boolean;
+        startMinimized: boolean;
         autoStartNodes: boolean;
       } = {
         healthIntervalSecs: healthInterval,
@@ -349,6 +353,7 @@ export default function App() {
         speedTopK,
         speedTestBytes: Math.round(speedTestMb * 1048576),
         launchAtLogin,
+        startMinimized: launchAtLogin && startMinimized,
         autoStartNodes,
       };
       if (cookieDraft.trim()) {
@@ -1181,6 +1186,12 @@ export default function App() {
                 setForm((f) => ({ ...f, lanAccess: v }))
               }
             />
+            {form.lanAccess ? (
+              <p className="pl-6 text-[10px] leading-4 text-amber-700 dark:text-amber-400">
+                注意：局域网内任何人都能使用该 SOCKS5，且内核不支持认证。
+                请仅在可信网络中开启。
+              </p>
+            ) : null}
           </div>
         </div>
       </Dialog>
@@ -1264,8 +1275,18 @@ export default function App() {
               id="launch-at-login"
               label="开机自启"
               checked={launchAtLogin}
-              onCheckedChange={setLaunchAtLogin}
+              onCheckedChange={(v) => {
+                setLaunchAtLogin(v);
+                if (!v) setStartMinimized(false);
+              }}
               disabled={settingsBusy}
+            />
+            <Checkbox
+              id="start-minimized"
+              label="开机后最小化到托盘"
+              checked={launchAtLogin && startMinimized}
+              onCheckedChange={setStartMinimized}
+              disabled={settingsBusy || !launchAtLogin}
             />
             <Checkbox
               id="auto-start-nodes"
@@ -1324,9 +1345,9 @@ export default function App() {
             <Field label="测速下载量（MB）">
               <Input
                 type="number"
-                min={0.25}
-                max={8}
-                step={0.25}
+                min={1}
+                max={50}
+                step={1}
                 value={speedTestMb}
                 onChange={(e) => setSpeedTestMb(Number(e.target.value) || 1)}
               />
