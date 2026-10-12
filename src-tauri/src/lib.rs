@@ -7,7 +7,7 @@ mod secure_store;
 mod settings;
 mod speed_select;
 
-use manager::{open_path, resolve_paths, Manager};
+use manager::{resolve_paths, Manager};
 use models::{AppInfo, LogEntry, NodeInput, NodeTestResult, ProxyNode};
 use settings::{AppSettingsPatch, AppSettingsView};
 use std::sync::Arc;
@@ -69,14 +69,18 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&show_i, &start_all_i, &stop_all_i, &quit_i])?;
 
     let icon = {
-        let candidates = [
-            app.path()
-                .resource_dir()
-                .ok()
-                .map(|p| p.join("icons").join("tray.png")),
-            Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("icons/tray.png")),
-            Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png")),
-        ];
+        let mut candidates = vec![app
+            .path()
+            .resource_dir()
+            .ok()
+            .map(|p| p.join("icons").join("tray.png"))];
+        // Source-tree icons are a dev convenience only; release builds use
+        // bundled resources or the app icon.
+        if cfg!(debug_assertions) {
+            let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            candidates.push(Some(manifest.join("icons/tray.png")));
+            candidates.push(Some(manifest.join("icons/32x32.png")));
+        }
         let mut img = None;
         for c in candidates.into_iter().flatten() {
             if c.exists() {
@@ -262,8 +266,8 @@ fn app_get_info(state: tauri::State<'_, AppState>) -> AppInfo {
 }
 
 #[tauri::command]
-fn app_open_path(path: String) -> Result<(), String> {
-    open_path(&path)
+fn app_open_path(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    state.manager.open_path(&path)
 }
 
 fn autostart_is_enabled(app: &AppHandle) -> bool {
@@ -386,7 +390,11 @@ pub fn run() {
         .setup(|app| {
             let (data_dir, resources_dir) = resolve_paths(app.handle());
             let manager = Arc::new(Manager::new(data_dir, resources_dir));
-            manager.init().map_err(|e| e.to_string())?;
+            // init() already recovers from a corrupt nodes.json; any remaining
+            // error (e.g. unwritable data dir) must not abort app startup.
+            if let Err(e) = manager.init() {
+                manager.add_startup_warning(format!("初始化节点失败，以空节点列表继续: {e}"));
+            }
             manager.set_app(app.handle().clone());
             app.manage(AppState {
                 manager: Arc::clone(&manager),
@@ -395,10 +403,16 @@ pub fn run() {
             setup_tray(app.handle())?;
             rebuild_tray_tooltip(app.handle(), &manager);
 
-            // Keep OS autostart registration aligned with settings.
-            let want_login = manager.launch_at_login_setting();
-            if let Err(e) = apply_launch_at_login(app.handle(), want_login) {
-                eprintln!("autostart sync: {e}");
+            // Keep OS autostart registration aligned with settings — but only
+            // when settings.json loaded cleanly. Defaults that replaced an
+            // unreadable/corrupt file must not silently remove the login item.
+            if manager.settings_loaded_cleanly() {
+                let want_login = manager.launch_at_login_setting();
+                if let Err(e) = apply_launch_at_login(app.handle(), want_login) {
+                    eprintln!("autostart sync: {e}");
+                }
+            } else {
+                eprintln!("autostart sync skipped: settings.json was not loaded cleanly");
             }
 
             // Login-item launch + setting on → stay in tray (no main window).

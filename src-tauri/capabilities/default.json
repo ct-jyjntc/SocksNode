@@ -24,8 +24,6 @@
     "core:window:allow-set-decorations",
     "core:app:default",
     "core:tray:default",
-    "shell:allow-open",
-    "opener:default",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",

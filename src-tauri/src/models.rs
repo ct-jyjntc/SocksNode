@@ -49,9 +49,10 @@ pub struct ProxyNode {
     pub udp: bool,
     pub sni: String,
     pub skip_cert_verify: bool,
-    /// Enable AnyTLS client session reuse. Default off: kernel runs with -dr
-    /// (every connection dials fresh) unless the user opts in.
-    #[serde(default)]
+    /// Enable AnyTLS client session reuse. When off the kernel runs with -dr
+    /// (every connection dials fresh). Missing field = on, matching the
+    /// behaviour of nodes created before this toggle existed.
+    #[serde(default = "default_true")]
     pub session_reuse: bool,
     pub local_port: u16,
     pub enabled: bool,
@@ -94,7 +95,7 @@ pub struct NodeInput {
     pub sni: String,
     #[serde(default)]
     pub skip_cert_verify: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub session_reuse: bool,
     pub local_port: u16,
     #[serde(default = "default_true")]
@@ -121,6 +122,8 @@ pub struct AppInfo {
     pub data_dir: String,
     pub kernel_path: String,
     pub version: String,
+    /// Config problems found at startup (corrupt files, disabled duplicates).
+    pub startup_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,7 +153,12 @@ pub(crate) struct StoredNode {
     sni: String,
     #[serde(rename = "skipCertVerify", alias = "skip_cert_verify")]
     skip_cert_verify: bool,
-    #[serde(rename = "sessionReuse", alias = "session_reuse", default)]
+    /// Old nodes.json files predate this field; they always reused sessions.
+    #[serde(
+        rename = "sessionReuse",
+        alias = "session_reuse",
+        default = "default_true"
+    )]
     session_reuse: bool,
     #[serde(rename = "localPort", alias = "local_port")]
     local_port: u16,
@@ -327,7 +335,16 @@ pub fn legacy_id_map(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-pub fn store_from_json(raw: &str) -> Result<Vec<ProxyNode>, serde_json::Error> {
+/// Load nodes from nodes.json.
+///
+/// Returns the nodes plus `(node_id, message)` warnings for repairs applied
+/// while loading. Duplicate local ports (hand-edited files) do not fail the
+/// whole load: every later node sharing a port is disabled instead, so the
+/// user keeps their config and can fix the port in the UI.
+#[allow(clippy::type_complexity)]
+pub fn store_from_json(
+    raw: &str,
+) -> Result<(Vec<ProxyNode>, Vec<(String, String)>), serde_json::Error> {
     let mut store: StoreFile = serde_json::from_str(raw)?;
     let mut seen = std::collections::HashSet::new();
     for node in &mut store.nodes {
@@ -351,9 +368,34 @@ pub fn store_from_json(raw: &str) -> Result<Vec<ProxyNode>, serde_json::Error> {
             )));
         }
     }
-    Ok(store
-        .nodes
-        .into_iter()
-        .map(ProxyNode::from_stored)
-        .collect())
+    let mut warnings = Vec::new();
+    let mut ports: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+    for node in &mut store.nodes {
+        match ports.get(&node.local_port) {
+            Some(owner) => {
+                let was_enabled = node.enabled;
+                node.enabled = false;
+                warnings.push((
+                    node.id.clone(),
+                    format!(
+                        "配置加载：本地端口 {} 与节点「{}」重复，{}；请修改本地端口",
+                        node.local_port,
+                        owner,
+                        if was_enabled { "已自动停用本节点" } else { "本节点保持停用" }
+                    ),
+                ));
+            }
+            None => {
+                ports.insert(node.local_port, node.name.clone());
+            }
+        }
+    }
+    Ok((
+        store
+            .nodes
+            .into_iter()
+            .map(ProxyNode::from_stored)
+            .collect(),
+        warnings,
+    ))
 }

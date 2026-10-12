@@ -1,15 +1,19 @@
 use crate::ilatency;
 use crate::ip_probe::{
-    is_domain_host, merge_unique, probe_all, resolve_doh, resolve_system, tcping_with_retries,
+    bare_host, fmt_host_port, is_domain_host, is_ipv6_literal, merge_unique,
+    probe_all_cancellable, resolve_doh, resolve_system_cancellable, tcping,
+    tcping_with_retries,
 };
 use crate::net_bind;
 use crate::models::{
     default_nodes, now_iso, legacy_id_map, store_from_json, store_to_json, AppInfo, LogEntry, LogEvent, NodeInput,
     NodeStatus, NodeTestResult, ProbeStatus, ProxyNode,
 };
-use crate::settings::{AppSettings, AppSettingsPatch, AppSettingsView};
+use crate::settings::{
+    json_error_summary, strip_utf8_bom, AppSettings, AppSettingsPatch, AppSettingsView,
+};
 use crate::speed_select::{
-    measure_proxy_mbps, rank_and_pick, SelectStrategy,
+    measure_proxy_mbps, rank_and_pick, ProbeKernel, SelectStrategy, TempKernels, CANCELLED,
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -17,7 +21,7 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,15 +41,43 @@ const TCPING_TIMEOUT: Duration = Duration::from_secs(2);
 const TCPING_RETRIES: u32 = 3;
 const TCPING_RETRY_GAP: Duration = Duration::from_secs(1);
 
+/// One in-flight start per node. `generation` is filled in once the start
+/// has bumped the node generation; a slot whose generation is no longer
+/// current belongs to a cancelled start and may be taken over.
+#[derive(Clone, Copy)]
+struct StartSlot {
+    token: u64,
+    generation: Option<u64>,
+}
+
+type SharedStartSlots = Arc<Mutex<HashMap<String, StartSlot>>>;
+
+static START_TOKEN: AtomicU64 = AtomicU64::new(0);
+
 /// Prevent concurrent start of the same node (map insert would orphan the first Child).
 struct StartGuard {
-    set: Arc<Mutex<HashSet<String>>>,
+    set: SharedStartSlots,
     id: String,
+    token: u64,
+}
+
+impl StartGuard {
+    fn set_generation(&self, generation: u64) {
+        if let Some(slot) = self.set.lock().get_mut(&self.id) {
+            if slot.token == self.token {
+                slot.generation = Some(generation);
+            }
+        }
+    }
 }
 
 impl Drop for StartGuard {
     fn drop(&mut self) {
-        self.set.lock().remove(&self.id);
+        // A newer start may have taken over this slot; never clear its guard.
+        let mut set = self.set.lock();
+        if set.get(&self.id).is_some_and(|slot| slot.token == self.token) {
+            set.remove(&self.id);
+        }
     }
 }
 
@@ -110,7 +142,9 @@ fn pid_is_our_kernel(pid: u32, kernel: &std::path::Path) -> bool {
 
 /// Kill LISTENers on port only if they are our own anytls-client.
 /// Foreign listeners are left alone; callers surface a port-conflict error.
-fn kill_owned_listeners_on_port(port: u16, kernel: &std::path::Path) {
+/// `protected` pids (kernels of other nodes, temporary speed-test kernels)
+/// are never killed, even when they listen on the same port.
+fn kill_owned_listeners_on_port(port: u16, kernel: &std::path::Path, protected: &HashSet<u32>) {
     let port = port.to_string();
     let tcp_filter = ["-iTCP:", &port].concat();
     let output = Command::new("lsof")
@@ -128,7 +162,7 @@ fn kill_owned_listeners_on_port(port: u16, kernel: &std::path::Path) {
     };
     for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
         if let Ok(p) = pid.parse::<u32>() {
-            if pid_is_our_kernel(p, kernel) {
+            if !protected.contains(&p) && pid_is_our_kernel(p, kernel) {
                 force_kill_pid(p);
             }
         }
@@ -139,6 +173,43 @@ fn kill_child_process(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// Kernel behaviour flags derived from the node; shared by the real kernel
+/// and the temporary speed-test kernels so both behave the same.
+fn kernel_flag_args(node: &ProxyNode) -> Vec<String> {
+    let mut args = Vec::new();
+    if !node.session_reuse {
+        args.push("-dr".into());
+    }
+    if !node.udp {
+        args.push("-udp=false".into());
+    }
+    args
+}
+
+/// `tcping_with_retries` that gives up as soon as `cancelled()` turns true.
+fn tcping_retries_cancellable(
+    ip: &str,
+    port: u16,
+    retries: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<u64> {
+    let attempts = retries.saturating_add(1);
+    for i in 0..attempts {
+        if cancelled() {
+            return None;
+        }
+        if let Some(ms) = tcping(ip, port, TCPING_TIMEOUT) {
+            return Some(ms);
+        }
+        if i + 1 < attempts {
+            thread::sleep(TCPING_RETRY_GAP);
+        }
+    }
+    None
+}
+
+const IPV6_UPSTREAM_HINT: &str = "warning: 上游是 IPv6 地址，但 anytls 内核出站固定绑定物理网卡的 IPv4 地址（-bind / 自动探测），IPv6 上游通常无法连接；若启动后无法使用，请改填 IPv4 地址或域名";
 
 pub struct Manager {
     data_dir: PathBuf,
@@ -154,13 +225,23 @@ pub struct Manager {
     /// host -> (cached_at, ips); short TTL for multi-location DNS.
     dns_cache: SharedDnsCache,
     /// Node ids currently inside `start()` — blocks double-start races.
-    starting_ids: Arc<Mutex<HashSet<String>>>,
+    starting_ids: SharedStartSlots,
     /// Per-node watcher generation; bumped on every start/stop so stale
     /// health/exit watchers terminate instead of piling up.
     generations: SharedGenerations,
     lifecycle_gates: SharedLifecycleGates,
     batch_generation: Arc<AtomicU64>,
     is_shutting_down: Arc<Mutex<bool>>,
+    /// Temporary speed-test kernels (killed on Stop of their node and on shutdown).
+    temp_kernels: TempKernels,
+    /// Problems found while loading config, shown to the user once at startup.
+    startup_warnings: Arc<Mutex<Vec<String>>>,
+    /// nodes.json exists but could not be read: never overwrite it this run.
+    store_read_only: Arc<AtomicBool>,
+    /// settings.json could not be read / moved aside: never overwrite it this run.
+    settings_read_only: Arc<AtomicBool>,
+    /// settings.json was read without any warning at startup.
+    settings_loaded_cleanly: bool,
     app: Mutex<Option<AppHandle>>,
 }
 
@@ -168,7 +249,9 @@ impl Manager {
     pub fn new(data_dir: PathBuf, resources_dir: PathBuf) -> Self {
         let store_path = data_dir.join("nodes.json");
         let instances_dir = data_dir.join("instances");
-        let settings = AppSettings::load(&data_dir);
+        let loaded = AppSettings::load(&data_dir);
+        let settings = loaded.settings;
+        let settings_loaded_cleanly = loaded.warning.is_none();
         Self {
             data_dir,
             resources_dir,
@@ -181,11 +264,16 @@ impl Manager {
             settings: Arc::new(Mutex::new(settings)),
             last_failover_at: Arc::new(Mutex::new(HashMap::new())),
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
-            starting_ids: Arc::new(Mutex::new(HashSet::new())),
+            starting_ids: Arc::new(Mutex::new(HashMap::new())),
             generations: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_gates: Arc::new(Mutex::new(HashMap::new())),
             batch_generation: Arc::new(AtomicU64::new(0)),
             is_shutting_down: Arc::new(Mutex::new(false)),
+            temp_kernels: TempKernels::default(),
+            startup_warnings: Arc::new(Mutex::new(loaded.warning.into_iter().collect())),
+            store_read_only: Arc::new(AtomicBool::new(false)),
+            settings_read_only: Arc::new(AtomicBool::new(loaded.read_only)),
+            settings_loaded_cleanly,
             app: Mutex::new(None),
         }
     }
@@ -241,10 +329,22 @@ impl Manager {
             if !pending.launch_at_login {
                 pending.start_minimized = false;
             }
+            if self.settings_read_only.load(Ordering::Acquire) {
+                return Err(format!(
+                    "设置文件无法读取，本次运行不保存修改；请修复 {} 后重启应用",
+                    AppSettings::path(&self.data_dir).display()
+                ));
+            }
             pending.save(&self.data_dir)?;
             *settings = pending;
         }
         Ok(self.get_settings_view(launch_at_login_active))
+    }
+
+    /// False when settings.json was unreadable or replaced by defaults at
+    /// startup; OS-level state (login item) must then be left untouched.
+    pub fn settings_loaded_cleanly(&self) -> bool {
+        self.settings_loaded_cleanly
     }
 
     pub fn launch_at_login_setting(&self) -> bool {
@@ -273,25 +373,98 @@ impl Manager {
         *self.app.lock() = Some(app);
     }
 
-    pub fn init(&self) -> Result<(), String> {
-        std::fs::create_dir_all(&self.instances_dir).map_err(|e| e.to_string())?;
-        let mut nodes = if self.store_path.exists() {
-            let raw = std::fs::read_to_string(&self.store_path).map_err(|e| e.to_string())?;
-            // Upgrade pre-UUID-hardening node ids; carry each node's instance
-            // dir (config, cache, logs) over to the migrated id.
-            let migrations = legacy_id_map(&raw);
-            for (old, new) in &migrations {
-                let from = self.instances_dir.join(old);
-                let to = self.instances_dir.join(new);
-                if from.exists() && !to.exists() {
-                    let _ = std::fs::rename(&from, &to);
+    /// Move an unparsable nodes.json aside so startup can continue.
+    /// When the rename fails the original stays in place and is protected
+    /// from being overwritten for the rest of this run.
+    fn quarantine_corrupt_store(&self, reason: &str) {
+        let ts = chrono::Utc::now().timestamp();
+        let backup = self
+            .store_path
+            .with_file_name(format!("nodes.json.corrupt-{ts}"));
+        match std::fs::rename(&self.store_path, &backup) {
+            Ok(()) => {
+                self.add_startup_warning(format!(
+                    "nodes.json 无法解析（{reason}），已备份为 {}，以空节点列表启动",
+                    backup.display()
+                ));
+                if let Err(e) = self.persist_nodes(&[]) {
+                    eprintln!("[socks-node] 写入新 nodes.json 失败: {e}");
                 }
             }
-            let nodes = store_from_json(&raw).map_err(|e| e.to_string())?;
-            if !migrations.is_empty() {
-                self.persist_nodes(&nodes)?;
+            Err(e) => {
+                self.store_read_only.store(true, Ordering::Release);
+                self.add_startup_warning(format!(
+                    "nodes.json 无法解析（{reason}），备份失败（{e}）；以空节点列表启动，本次运行不保存节点修改以免覆盖原文件"
+                ));
             }
-            nodes
+        }
+    }
+
+    pub fn init(&self) -> Result<(), String> {
+        std::fs::create_dir_all(&self.instances_dir).map_err(|e| e.to_string())?;
+        let mut load_warnings: Vec<(String, String)> = Vec::new();
+        let mut nodes = if self.store_path.exists() {
+            match std::fs::read(&self.store_path) {
+                Err(e) => {
+                    // I/O failure (e.g. EACCES) is not corruption: do not
+                    // rename, and never write over the file during this run.
+                    self.store_read_only.store(true, Ordering::Release);
+                    self.add_startup_warning(format!(
+                        "nodes.json 无法读取（{e}），本次以空节点列表启动，且不会保存节点修改以免覆盖原文件；请检查文件权限后重启"
+                    ));
+                    Vec::new()
+                }
+                Ok(bytes) => {
+                    let parsed = std::str::from_utf8(strip_utf8_bom(&bytes))
+                        .map_err(|_| "文件不是有效的 UTF-8 文本".to_string())
+                        .and_then(|raw| {
+                            // Positions/kinds only: serde's text can quote a password.
+                            let loaded = store_from_json(raw).map_err(|e| {
+                                if e.classify() == serde_json::error::Category::Io {
+                                    // Our own validation message (no field values).
+                                    e.to_string()
+                                } else {
+                                    json_error_summary(&e)
+                                }
+                            })?;
+                            Ok((raw.to_string(), loaded))
+                        });
+                    match parsed {
+                        Ok((raw, (nodes, warnings))) => {
+                            // Upgrade pre-UUID-hardening node ids; carry each node's
+                            // instance dir (config, cache, logs) over to the new id.
+                            let migrations = legacy_id_map(&raw);
+                            for (old, new) in &migrations {
+                                let from = self.instances_dir.join(old);
+                                let to = self.instances_dir.join(new);
+                                if from.exists() && !to.exists() {
+                                    let _ = std::fs::rename(&from, &to);
+                                }
+                            }
+                            if !migrations.is_empty() || !warnings.is_empty() {
+                                if let Err(e) = self.persist_nodes(&nodes) {
+                                    eprintln!("[socks-node] 写回 nodes.json 失败: {e}");
+                                }
+                            }
+                            for (id, msg) in &warnings {
+                                let name = nodes
+                                    .iter()
+                                    .find(|n| &n.id == id)
+                                    .map(|n| n.name.as_str())
+                                    .unwrap_or(id.as_str());
+                                self.add_startup_warning(format!("节点「{name}」：{msg}"));
+                            }
+                            load_warnings = warnings;
+                            nodes
+                        }
+                        Err(e) => {
+                            // A broken config must never abort app setup.
+                            self.quarantine_corrupt_store(&e);
+                            Vec::new()
+                        }
+                    }
+                }
+            }
         } else {
             let defaults = default_nodes();
             self.persist_nodes(&defaults)?;
@@ -303,7 +476,8 @@ impl Manager {
         let kernel = self.kernel_path();
         for n in &nodes {
             if !port_is_free(n.local_port) {
-                kill_owned_listeners_on_port(n.local_port, &kernel);
+                // Nothing of ours runs yet: every listener here is a leftover.
+                kill_owned_listeners_on_port(n.local_port, &kernel, &HashSet::new());
             }
         }
         thread::sleep(Duration::from_millis(80));
@@ -318,10 +492,50 @@ impl Manager {
         }
         drop(logs);
         *self.nodes.lock() = nodes;
+        for (id, msg) in load_warnings {
+            self.append_log(&id, msg);
+        }
         Ok(())
     }
 
+    /// Pids that belong to other nodes or to temporary speed tests.
+    fn foreign_kernel_pids(&self, id: &str) -> HashSet<u32> {
+        let mut pids: HashSet<u32> = self
+            .nodes
+            .lock()
+            .iter()
+            .filter(|n| n.id != id)
+            .filter_map(|n| n.pid)
+            .collect();
+        pids.extend(
+            self.processes
+                .lock()
+                .iter()
+                .filter(|(owner, _)| owner.as_str() != id)
+                .map(|(_, child)| child.id()),
+        );
+        pids.extend(self.temp_kernels.pids());
+        pids
+    }
+
+    /// Name of another active node that already uses `port`.
+    fn port_used_by_other_node(&self, port: u16, id: &str) -> Option<String> {
+        self.nodes
+            .lock()
+            .iter()
+            .find(|n| {
+                n.id != id
+                    && n.local_port == port
+                    && matches!(
+                        n.status,
+                        NodeStatus::Running | NodeStatus::Starting | NodeStatus::Stopping
+                    )
+            })
+            .map(|n| n.name.clone())
+    }
+
     /// Kill managed child + recorded pid, and free the local SOCKS port if needed.
+    /// Listeners owned by other nodes are left alone.
     fn reclaim_node_runtime(&self, id: &str, local_port: u16) {
         if let Some(mut child) = self.processes.lock().remove(id) {
             kill_child_process(&mut child);
@@ -337,7 +551,7 @@ impl Manager {
             }
         }
         if !port_is_free(local_port) {
-            kill_owned_listeners_on_port(local_port, &kernel);
+            kill_owned_listeners_on_port(local_port, &kernel, &self.foreign_kernel_pids(id));
             // TIME_WAIT / kernel release
             for _ in 0..10 {
                 thread::sleep(Duration::from_millis(40));
@@ -391,6 +605,11 @@ impl Manager {
         self.generations.lock().get(id).copied() == Some(generation)
     }
 
+    /// True once Stop / edit / delete / shutdown has superseded `generation`.
+    fn superseded(&self, id: &str, generation: u64) -> bool {
+        *self.is_shutting_down.lock() || !self.generation_is_current(id, generation)
+    }
+
     fn cancelled_start(&self, silent: bool) -> Result<Vec<ProxyNode>, String> {
         if silent {
             Ok(self.list())
@@ -401,16 +620,38 @@ impl Manager {
 
     fn begin_start_guard(&self, id: &str) -> Option<StartGuard> {
         let mut set = self.starting_ids.lock();
-        if !set.insert(id.to_string()) {
-            return None;
+        if let Some(slot) = set.get(id) {
+            // Take over only from a start whose generation was superseded by
+            // Stop / edit / delete; it may still be finishing a network call
+            // but will exit at its next cancellation check.
+            let stale = slot
+                .generation
+                .is_some_and(|generation| !self.generation_is_current(id, generation));
+            if !stale {
+                return None;
+            }
         }
+        let token = START_TOKEN.fetch_add(1, Ordering::Relaxed) + 1;
+        set.insert(
+            id.to_string(),
+            StartSlot {
+                token,
+                generation: None,
+            },
+        );
         Some(StartGuard {
             set: Arc::clone(&self.starting_ids),
             id: id.to_string(),
+            token,
         })
     }
 
     fn persist_nodes(&self, nodes: &[ProxyNode]) -> Result<(), String> {
+        if self.store_read_only.load(Ordering::Acquire) {
+            return Err(
+                "nodes.json 启动时无法读取，为避免覆盖原文件，本次运行不保存修改；请检查文件后重启应用".into(),
+            );
+        }
         let json = store_to_json(nodes).map_err(|e| e.to_string())?;
         crate::secure_store::write_private(&self.store_path, json.as_bytes())
     }
@@ -457,7 +698,14 @@ impl Manager {
             data_dir: self.data_dir.display().to_string(),
             kernel_path: self.kernel_path().display().to_string(),
             version: version.to_string(),
+            startup_warnings: self.startup_warnings.lock().clone(),
         }
+    }
+
+    pub fn add_startup_warning(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        eprintln!("[socks-node] {msg}");
+        self.startup_warnings.lock().push(msg);
     }
 
     pub fn kernel_path(&self) -> PathBuf {
@@ -474,6 +722,14 @@ impl Manager {
     }
 
     fn append_log(&self, id: &str, line: impl AsRef<str>) {
+        // Hold log_io across the existence check and the file write; remove()
+        // deletes the instance dir under the same lock. A log line from a
+        // still-running start/probe thread therefore can never recreate the
+        // directory of a node that was just deleted.
+        let _io = self.log_io.lock();
+        if !self.nodes.lock().iter().any(|n| n.id == id) {
+            return;
+        }
         let entry = LogEntry {
             ts: now_iso(),
             line: line.as_ref().trim_end().chars().take(4096).collect(),
@@ -491,7 +747,6 @@ impl Manager {
         // Persist for later inspection (UI + after restart).
         let log_path = self.instances_dir.join(id).join("runtime.log");
         {
-            let _io = self.log_io.lock();
             if let Some(parent) = log_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -517,6 +772,7 @@ impl Manager {
                 let _ = writeln!(file, "{} {}", entry.ts, entry.line);
             }
         }
+        drop(_io);
         if let Some(app) = self.app.lock().as_ref() {
             let _ = app.emit(
                 "nodes:log",
@@ -541,15 +797,26 @@ impl Manager {
         existing_id: Option<&str>,
     ) -> Result<NodeInput, String> {
         let name = input.name.trim().to_string();
-        let server = input.server.trim().to_string();
-        let password = input.password.trim().to_string();
+        // IPv6 literals are stored bare ("2001:db8::1"); "[2001:db8::1]" is
+        // accepted too. Brackets are added when building host:port.
+        let server = bare_host(&input.server).to_string();
+        // Passwords are used verbatim: leading/trailing spaces may be part of
+        // the secret. Whitespace-only still counts as empty.
+        let password = input.password.clone();
         if name.is_empty() {
             return Err("节点名称不能为空".into());
         }
         if server.is_empty() {
             return Err("服务器地址不能为空".into());
         }
-        if password.is_empty() {
+        // Anything with ':' or brackets must be a plain IPv6 literal; zone ids
+        // (fe80::1%en0) and host:port forms are rejected.
+        if server.contains([':', '[', ']', '%'])
+            && (server.contains('%') || server.parse::<std::net::Ipv6Addr>().is_err())
+        {
+            return Err("服务器地址无效".into());
+        }
+        if password.trim().is_empty() {
             return Err("密码不能为空".into());
         }
         if input.port == 0 {
@@ -657,8 +924,18 @@ impl Manager {
         if was_running || was_starting {
             self.stop_locked(id, true)?;
         }
-        {
+        // normalize_input already rejected a taken port before the Stop above.
+        // The recheck below only catches a concurrent create/update in that
+        // window; on any write failure the previously running node is restarted
+        // with its old config instead of being left stopped.
+        let write = (|| -> Result<(), String> {
             let mut nodes = self.nodes.lock();
+            if nodes
+                .iter()
+                .any(|n| n.id != id && n.local_port == data.local_port)
+            {
+                return Err(format!("本地端口 {} 已被其他节点使用", data.local_port));
+            }
             let mut next = nodes.clone();
             let node = next.iter_mut().find(|n| n.id == id).ok_or("节点不存在")?;
             // Drop sticky IP only when the upstream identity changes.
@@ -686,6 +963,15 @@ impl Manager {
             node.refresh_public_fields();
             self.persist_nodes(&next)?;
             *nodes = next;
+            Ok(())
+        })();
+        if let Err(e) = write {
+            let revision = self.generations.lock().get(id).copied().unwrap_or(0);
+            drop(transition);
+            if was_running {
+                let _ = self.start_expected(id, true, Some(revision), None);
+            }
+            return Err(e);
         }
         self.emit_nodes();
         let revision = self.generations.lock().get(id).copied().unwrap_or(0);
@@ -713,6 +999,7 @@ impl Manager {
         } else {
             // Invalidate queued transitions even when the node is already stopped.
             self.bump_generation(id);
+            self.temp_kernels.kill_owner(id);
         }
         {
             let mut nodes = self.nodes.lock();
@@ -725,7 +1012,11 @@ impl Manager {
         self.last_failover_at.lock().remove(id);
         self.lifecycle_gates.lock().remove(id);
         let dir = self.instances_dir.join(id);
-        let _ = std::fs::remove_dir_all(dir);
+        {
+            // See append_log: same lock as the log writer's existence check.
+            let _io = self.log_io.lock();
+            let _ = std::fs::remove_dir_all(dir);
+        }
         self.emit_nodes();
         Ok(self.list())
     }
@@ -802,6 +1093,7 @@ impl Manager {
             }
         }
         let generation = self.bump_generation(id);
+        _guard.set_generation(generation);
 
         let kernel = self.kernel_path();
         if !kernel.exists() {
@@ -816,11 +1108,20 @@ impl Manager {
 
         // Always reclaim first — prevents "address already in use" from orphans
         // when map insert previously dropped a live Child without kill.
+        // Another active node owns this port (e.g. a duplicate-port node that
+        // was disabled at load): refuse before reclaiming anything.
+        if let Some(owner) = self.port_used_by_other_node(local_port, id) {
+            return self.abort_start(
+                id,
+                format!("端口 {local_port} 已被节点「{owner}」使用"),
+                silent,
+            );
+        }
         self.reclaim_node_runtime(id, local_port);
 
         if let Err(e) = self.assert_port_available(local_port, id) {
             // One more aggressive reclaim then recheck.
-            kill_owned_listeners_on_port(local_port, &kernel);
+            kill_owned_listeners_on_port(local_port, &kernel, &self.foreign_kernel_pids(id));
             thread::sleep(Duration::from_millis(100));
             return self.abort_start(id, e, silent);
         }
@@ -881,7 +1182,7 @@ impl Manager {
                 node.active_ip = Some(upstream_host.clone());
             }
         }
-        let server = format!("{}:{}", upstream_host, node_snapshot.port);
+        let server = fmt_host_port(&upstream_host, node_snapshot.port);
         let sni = if node_snapshot.sni.is_empty() {
             "www.icloud.com".to_string()
         } else {
@@ -908,6 +1209,9 @@ impl Manager {
         if !bind_args.is_empty() {
             self.append_log(id, format!("anytls physical bind: {}", bind_args.join(" ")));
         }
+        if is_ipv6_literal(&upstream_host) {
+            self.append_log(id, IPV6_UPSTREAM_HINT);
+        }
         let mut args: Vec<String> = vec![
             "-l".into(),
             listen.clone(),
@@ -919,12 +1223,7 @@ impl Manager {
         if node_snapshot.skip_cert_verify {
             args.push("-insecure".into());
         }
-        if !node_snapshot.session_reuse {
-            args.push("-dr".into());
-        }
-        if !node_snapshot.udp {
-            args.push("-udp=false".into());
-        }
+        args.extend(kernel_flag_args(&node_snapshot));
         args.extend(bind_args);
         let mut child = match Command::new(&kernel)
             .args(&args)
@@ -1152,6 +1451,10 @@ impl Manager {
         }
 
         self.bump_generation(id);
+        // In-flight speed tests of this node end immediately: their curl fails
+        // once the temporary kernel is gone, and the cancellation checks in
+        // the selection path return right after.
+        self.temp_kernels.kill_owner(id);
 
         let local_port = {
             let nodes = self.nodes.lock();
@@ -1408,6 +1711,8 @@ impl Manager {
         for (_, mut child) in children {
             kill_child_process(&mut child);
         }
+        // Temporary speed-test kernels are not in `processes`; reap them too.
+        self.temp_kernels.kill_all();
     }
 
     pub fn status_summary(&self) -> (usize, usize) {
@@ -1422,13 +1727,22 @@ impl Manager {
 
     /// Resolve a domain on the physical NIC (DoH), never system DNS / fake-ip.
     /// Used when preferFastestIp is off — still must not pass raw domain to anytls.
-    fn resolve_domain_safe(&self, host: &str, port: u16, node_id: &str) -> Result<String, String> {
+    fn resolve_domain_safe(
+        &self,
+        host: &str,
+        port: u16,
+        node_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String, String> {
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         self.append_log(
             node_id,
             format!("resolving {host} via physical DoH (preferFastestIp=off) …"),
         );
         // Physical DoH first (223.5.5.5 etc. over en0).
-        let mut ips = match net_bind::resolve_a_direct(host) {
+        let mut ips = match net_bind::resolve_a_direct_cancellable(host, cancelled) {
             Ok(v) => {
                 self.append_log(node_id, format!("DNS/direct: {}", v.join(", ")));
                 v
@@ -1438,9 +1752,12 @@ impl Manager {
                 Vec::new()
             }
         };
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         if ips.is_empty() {
             // Last resort: system DNS with fake-ip filter (usually empty under Surge).
-            match resolve_system(host, port) {
+            match resolve_system_cancellable(host, port, cancelled) {
                 Ok(v) => {
                     self.append_log(node_id, format!("DNS/system-fallback: {}", v.join(", ")));
                     ips = v;
@@ -1455,7 +1772,11 @@ impl Manager {
         }
         // If multiple A records, pick lowest physical tcping (cheap, no iLatency).
         if ips.len() > 1 {
-            if let Some((ip, ms, _)) = crate::ip_probe::pick_fastest(&ips, port, TCPING_TIMEOUT) {
+            let ranked = probe_all_cancellable(&ips, port, TCPING_TIMEOUT, cancelled);
+            if cancelled() {
+                return Err(CANCELLED.into());
+            }
+            if let Some((ip, ms)) = ranked.iter().find_map(|r| r.ms.map(|ms| (r.ip.clone(), ms))) {
                 self.append_log(
                     node_id,
                     format!("resolved {host} → {ip} ({ms}ms, local A-record pick)"),
@@ -1512,17 +1833,20 @@ impl Manager {
     /// - Domain + preferFastestIp → multi-source + tcping + speed
     /// - Domain without preferFastestIp → physical DoH resolve (never pass domain to anytls)
     fn select_upstream_ip(&self, node: &ProxyNode, generation: u64) -> Result<String, String> {
+        let cancelled = || self.superseded(&node.id, generation);
+        let cancelled: &dyn Fn() -> bool = &cancelled;
         let server = node.server.trim();
         if server.is_empty() {
             return Err("服务器地址为空".into());
         }
         if !is_domain_host(server) {
-            return Ok(server.to_string());
+            // Bare literal (IPv6 brackets are re-added by fmt_host_port).
+            return Ok(bare_host(server).to_string());
         }
         if !node.prefer_fastest_ip {
             // CRITICAL: never hand the domain to anytls — it would use system DNS
             // and get Surge/Clash fake-ip (198.18.x), then fail to connect.
-            match self.resolve_domain_safe(server, node.port, &node.id) {
+            match self.resolve_domain_safe(server, node.port, &node.id, cancelled) {
                 Ok(ip) => {
                     self.publish_selection(node, generation, None, Some(ProbeStatus {
                                 ok: true,
@@ -1543,19 +1867,27 @@ impl Manager {
             }
         } else {
             // Sticky: if we already picked an IP and it is still alive, skip full re-test.
-            if let Some(sticky) = node
+            let mut sticky_ip = node
                 .active_ip
                 .as_ref()
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && !is_domain_host(s))
-            {
-                if let Some(ms) = tcping_with_retries(
-                    &sticky,
-                    node.port,
-                    TCPING_TIMEOUT,
-                    TCPING_RETRIES,
-                    TCPING_RETRY_GAP,
-                ) {
+                .filter(|s| !s.is_empty() && !is_domain_host(s));
+            if let Some(v6) = sticky_ip.as_ref().filter(|s| is_ipv6_literal(s)) {
+                // Persisted by an older build; the kernel can not dial IPv6.
+                self.append_log(
+                    &node.id,
+                    format!("ignore persisted IPv6 sticky IP {v6} — full re-select (IPv4 only)"),
+                );
+                self.publish_selection(node, generation, Some(None), None);
+                sticky_ip = None;
+            }
+            if let Some(sticky) = sticky_ip {
+                let alive =
+                    tcping_retries_cancellable(&sticky, node.port, TCPING_RETRIES, cancelled);
+                if cancelled() {
+                    return Err(CANCELLED.into());
+                }
+                if let Some(ms) = alive {
                     self.append_log(
                         &node.id,
                         format!(
@@ -1583,7 +1915,7 @@ impl Manager {
                 format!("selecting fastest IP for {server}:{} …", node.port),
             );
 
-            match self.collect_and_pick(node, &node.id) {
+            match self.collect_and_pick(node, &node.id, cancelled) {
                 Ok((ip, ms, mbps, detail)) => {
                     self.append_log(&node.id, detail);
                     let speed_part = mbps
@@ -1603,15 +1935,25 @@ impl Manager {
                     Ok(ip)
                 }
                 Err(err) => {
+                    if cancelled() {
+                        return Err(CANCELLED.into());
+                    }
                     self.append_log(
                         &node.id,
                         format!("IP 优选失败，尝试仅延迟优选: {err}"),
                     );
                     // Second chance: multi-source candidates + latency only (no speed test).
-                    let candidates = self.collect_candidate_ips(server, node.port, &node.id);
-                    if let Some((ip, ms, ranking)) =
-                        crate::ip_probe::pick_fastest(&candidates, node.port, TCPING_TIMEOUT)
-                    {
+                    let candidates =
+                        self.collect_candidate_ips(server, node.port, &node.id, cancelled);
+                    let ranking =
+                        probe_all_cancellable(&candidates, node.port, TCPING_TIMEOUT, cancelled);
+                    if cancelled() {
+                        return Err(CANCELLED.into());
+                    }
+                    let fastest = ranking
+                        .iter()
+                        .find_map(|r| r.ms.map(|ms| (r.ip.clone(), ms)));
+                    if let Some((ip, ms)) = fastest {
                         let line = ranking
                             .iter()
                             .map(|r| match r.ms {
@@ -1639,14 +1981,24 @@ impl Manager {
                             &node.id,
                             format!("latency-only 也失败，改为安全 DNS 解析: {err}"),
                         );
-                        self.resolve_domain_safe(server, node.port, &node.id)
+                        self.resolve_domain_safe(server, node.port, &node.id, cancelled)
                     }
                 }
             }
         }
     }
 
-    fn collect_candidate_ips(&self, host: &str, port: u16, node_id: &str) -> Vec<String> {
+    /// Returns an empty list as soon as `cancelled()` is true; callers re-check it.
+    fn collect_candidate_ips(
+        &self,
+        host: &str,
+        port: u16,
+        node_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Vec<String> {
+        if cancelled() {
+            return Vec::new();
+        }
         let mut sets: Vec<Vec<String>> = Vec::new();
         let host_key = host.trim().to_ascii_lowercase();
         // Expired entries must actually be evicted; otherwise every new hostname
@@ -1669,7 +2021,7 @@ impl Manager {
             }
         }
 
-        match resolve_system(host, port) {
+        match resolve_system_cancellable(host, port, cancelled) {
             Ok(ips) => {
                 self.append_log(
                     node_id,
@@ -1680,16 +2032,22 @@ impl Manager {
             Err(e) => self.append_log(node_id, format!("DNS/system: {e}")),
         }
 
-        let doh = resolve_doh(host);
+        if cancelled() {
+            return Vec::new();
+        }
+        let doh = resolve_doh(host, cancelled);
         if !doh.is_empty() {
             self.append_log(node_id, format!("DNS/DoH: {}", doh.join(", ")));
             sets.push(doh);
         }
 
+        if cancelled() {
+            return Vec::new();
+        }
         let cookie = self.settings.lock().ilatency_cookie.clone();
         if !cookie.trim().is_empty() {
             self.append_log(node_id, "DNS/iLatency: querying multi-location …");
-            let mut ilatency_ips = match ilatency::collect_a_records(host, &cookie) {
+            let mut ilatency_ips = match ilatency::collect_a_records(host, &cookie, cancelled) {
                 Ok(ips) => {
                     self.append_log(
                         node_id,
@@ -1697,9 +2055,10 @@ impl Manager {
                     );
                     ips
                 }
+                Err(_) if cancelled() => Vec::new(),
                 Err(e) => {
                     self.append_log(node_id, format!("DNS/iLatency: {e} · retry once …"));
-                    match ilatency::collect_a_records(host, &cookie) {
+                    match ilatency::collect_a_records(host, &cookie, cancelled) {
                         Ok(ips) => {
                             self.append_log(
                                 node_id,
@@ -1728,6 +2087,9 @@ impl Manager {
             );
         }
 
+        if cancelled() {
+            return Vec::new();
+        }
         let merged = merge_unique(sets);
         if merged.len() > 1 {
             self.dns_cache
@@ -1741,10 +2103,14 @@ impl Manager {
         &self,
         node: &ProxyNode,
         node_id: &str,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<(String, u64, Option<f64>, String), String> {
         let host = node.server.trim();
         let port = node.port;
-        let candidates = self.collect_candidate_ips(host, port, node_id);
+        let candidates = self.collect_candidate_ips(host, port, node_id, cancelled);
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         if candidates.is_empty() {
             return Err("无可用候选 IP".into());
         }
@@ -1790,7 +2156,10 @@ impl Manager {
                 strategy.label()
             ),
         );
-        let latency_results = probe_all(&candidates, port, TCPING_TIMEOUT);
+        let latency_results = probe_all_cancellable(&candidates, port, TCPING_TIMEOUT, cancelled);
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         if latency_results.iter().all(|r| r.ms.is_none()) {
             return Err("所有候选 IP 的 TCP 连接均失败".into());
         }
@@ -1820,8 +2189,16 @@ impl Manager {
         );
 
         let kernel = self.kernel_path();
-        let password = node.password.clone();
-        let sni = node.sni.clone();
+        let extra_args = kernel_flag_args(node);
+        let probe = ProbeKernel {
+            kernel: &kernel,
+            password: &node.password,
+            sni: &node.sni,
+            skip_cert_verify: node.skip_cert_verify,
+            extra_args: &extra_args,
+            owner: node_id,
+            registry: &self.temp_kernels,
+        };
         if !matches!(strategy, SelectStrategy::Latency) {
             self.append_log(
                 node_id,
@@ -1832,21 +2209,18 @@ impl Manager {
             );
         }
 
-        let (best, scored) = rank_and_pick(strategy, &latency_results, top_k, |ip| {
-            if !kernel.exists() {
-                return Err("找不到 anytls 内核".into());
-            }
-            measure_proxy_mbps(
-                &kernel,
-                ip,
-                port,
-                &password,
-                &sni,
-                node.skip_cert_verify,
-                speed_bytes,
-                speed_timeout,
-            )
-        })?;
+        let (best, scored) = rank_and_pick(
+            strategy,
+            &latency_results,
+            top_k,
+            |ip| {
+                if !kernel.exists() {
+                    return Err("找不到 anytls 内核".into());
+                }
+                measure_proxy_mbps(&probe, ip, port, speed_bytes, speed_timeout, cancelled)
+            },
+            cancelled,
+        )?;
 
         let mut score_lines = Vec::new();
         for s in &scored {
@@ -1895,6 +2269,11 @@ impl Manager {
         let lifecycle_gates = Arc::clone(&self.lifecycle_gates);
         let batch_generation = Arc::clone(&self.batch_generation);
         let shutting = Arc::clone(&self.is_shutting_down);
+        let temp_kernels = self.temp_kernels.clone();
+        let startup_warnings = Arc::clone(&self.startup_warnings);
+        let store_read_only = Arc::clone(&self.store_read_only);
+        let settings_read_only = Arc::clone(&self.settings_read_only);
+        let settings_loaded_cleanly = self.settings_loaded_cleanly;
         let app = self.app.lock().clone();
         // Manager methods need self — re-enter via a lightweight helper object.
         // We only need data_dir for nothing; failover will be inlined carefully.
@@ -1922,13 +2301,18 @@ impl Manager {
                 generations: Arc::clone(&generations),
                 lifecycle_gates: Arc::clone(&lifecycle_gates),
                 batch_generation: Arc::clone(&batch_generation),
+                temp_kernels,
+                startup_warnings,
+                store_read_only,
+                settings_read_only,
+                settings_loaded_cleanly,
                 app: Mutex::new(app.clone()),
             };
 
             loop {
                 let interval = {
                     let s = settings.lock();
-                    Duration::from_secs(s.health_interval_secs.max(3))
+                    Duration::from_secs(s.health_interval())
                 };
                 thread::sleep(interval);
                 if *shutting.lock() {
@@ -2005,7 +2389,7 @@ impl Manager {
 
                 let cooldown = {
                     let s = settings.lock();
-                    Duration::from_secs(s.failover_cooldown_secs.max(15))
+                    Duration::from_secs(s.failover_cooldown())
                 };
                 let allowed = {
                     let map = last_failover_at.lock();
@@ -2061,7 +2445,8 @@ impl Manager {
             .lock()
             .insert(id.to_string(), Instant::now());
 
-        let (best_ip, ms, mbps, detail) = self.collect_and_pick(&node, id)?;
+        let cancelled = || self.superseded(id, observed_generation);
+        let (best_ip, ms, mbps, detail) = self.collect_and_pick(&node, id, &cancelled)?;
         self.append_log(id, detail);
         let speed_part = mbps
             .map(|v| format!(" · {v:.2}Mbps"))
@@ -2073,15 +2458,17 @@ impl Manager {
             .unwrap_or_else(|| node.server.clone());
         if best_ip == current {
             // Still the same IP — verify once more; if dead, nothing better available.
-            if tcping_with_retries(
+            if tcping_retries_cancellable(
                 &best_ip,
                 node.port,
-                TCPING_TIMEOUT,
                 TCPING_RETRIES.saturating_sub(1),
-                TCPING_RETRY_GAP,
+                &cancelled,
             )
             .is_none()
             {
+                if cancelled() {
+                    return Err(CANCELLED.into());
+                }
                 return Err(format!(
                     "最优 IP 仍是 {best_ip} 且不可达，保持当前进程"
                 ));
@@ -2220,6 +2607,7 @@ impl Manager {
             return Ok(self.list());
         }
         let generation = self.bump_generation(id);
+        _guard.set_generation(generation);
 
         let kernel = self.kernel_path();
         if !kernel.exists() {
@@ -2231,9 +2619,18 @@ impl Manager {
             let node = nodes.iter().find(|n| n.id == id).ok_or("节点不存在")?;
             (node.local_port, node.name.clone())
         };
+        // Another active node owns this port (e.g. a duplicate-port node that
+        // was disabled at load): refuse before reclaiming anything.
+        if let Some(owner) = self.port_used_by_other_node(local_port, id) {
+            return self.abort_start(
+                id,
+                format!("端口 {local_port} 已被节点「{owner}」使用"),
+                silent,
+            );
+        }
         self.reclaim_node_runtime(id, local_port);
         if let Err(e) = self.assert_port_available(local_port, id) {
-            kill_owned_listeners_on_port(local_port, &kernel);
+            kill_owned_listeners_on_port(local_port, &kernel, &self.foreign_kernel_pids(id));
             thread::sleep(Duration::from_millis(100));
             return self.abort_start(id, e, silent);
         }
@@ -2263,7 +2660,7 @@ impl Manager {
             Err(e) => return self.abort_start(id, e, silent),
         };
         let listen = node_snapshot.listen_addr();
-        let server = format!("{}:{}", upstream_host, node_snapshot.port);
+        let server = fmt_host_port(upstream_host, node_snapshot.port);
         let sni = if node_snapshot.sni.is_empty() {
             "www.icloud.com".to_string()
         } else {
@@ -2286,6 +2683,9 @@ impl Manager {
         if !bind_args.is_empty() {
             self.append_log(id, format!("anytls physical bind: {}", bind_args.join(" ")));
         }
+        if is_ipv6_literal(upstream_host) {
+            self.append_log(id, IPV6_UPSTREAM_HINT);
+        }
         let mut args: Vec<String> = vec![
             "-l".into(),
             listen.clone(),
@@ -2297,12 +2697,7 @@ impl Manager {
         if node_snapshot.skip_cert_verify {
             args.push("-insecure".into());
         }
-        if !node_snapshot.session_reuse {
-            args.push("-dr".into());
-        }
-        if !node_snapshot.udp {
-            args.push("-udp=false".into());
-        }
+        args.extend(kernel_flag_args(&node_snapshot));
         args.extend(bind_args);
         let mut child = match Command::new(&kernel)
             .args(&args)
@@ -2551,8 +2946,10 @@ pub fn resolve_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
         .resource_dir()
         .unwrap_or_else(|_| PathBuf::from("src-tauri/resources"));
 
+    // Source-tree kernel only for debug builds; a release app must never pick
+    // up a binary from the build machine's checkout.
     let dev_resources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-    let resources_dir = if dev_resources.join("anytls-client").exists() {
+    let resources_dir = if cfg!(debug_assertions) && dev_resources.join("anytls-client").exists() {
         dev_resources
     } else if resources_dir.join("anytls-client").exists() {
         resources_dir
@@ -2569,19 +2966,48 @@ pub fn resolve_paths(app: &AppHandle) -> (PathBuf, PathBuf) {
     (data_dir, resources_dir)
 }
 
-pub fn open_path(path: &str) -> Result<(), String> {
+impl Manager {
+    /// Open the data directory (or a path inside it) in the file manager, or
+    /// an https:// URL in the browser. Everything else is rejected: this is
+    /// reachable from the webview and must not become a generic launcher.
+    pub fn open_path(&self, target: &str) -> Result<(), String> {
+        let target = target.trim();
+        let allowed = if target.starts_with("https://") {
+            if target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err("链接无效".into());
+            }
+            target.to_string()
+        } else {
+            let base = std::fs::canonicalize(&self.data_dir)
+                .map_err(|e| format!("数据目录不可用: {e}"))?;
+            let path = std::fs::canonicalize(target)
+                .map_err(|_| "路径不存在或无法访问".to_string())?;
+            if !path.starts_with(&base) {
+                return Err("只允许打开数据目录内的路径或 https 链接".into());
+            }
+            path.to_string_lossy().into_owned()
+        };
+        open_external(&allowed)
+    }
+}
+
+fn open_external(target: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
+        // "--" stops option parsing (verified: `open -- <path>` works on macOS).
         Command::new("open")
-            .arg(path)
+            .arg("--")
+            .arg(target)
             .spawn()
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+    // Targets here are absolute canonical paths or https:// URLs, so they can
+    // never start with '-'. xdg-open / explorer do not accept "--".
     #[cfg(target_os = "linux")]
     {
         Command::new("xdg-open")
-            .arg(path)
+            .arg(target)
             .spawn()
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -2589,7 +3015,7 @@ pub fn open_path(path: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         Command::new("explorer")
-            .arg(path)
+            .arg(target)
             .spawn()
             .map_err(|e| e.to_string())?;
         Ok(())

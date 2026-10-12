@@ -220,6 +220,14 @@ fn curl_base(interface: Option<&str>) -> Command {
 
 /// Resolve A records via DoH on the physical interface (no system DNS).
 pub fn resolve_a_direct(host: &str) -> Result<Vec<String>, String> {
+    resolve_a_direct_cancellable(host, &|| false)
+}
+
+/// Like `resolve_a_direct`, checking `cancelled()` before each DoH endpoint.
+pub fn resolve_a_direct_cancellable(
+    host: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<String>, String> {
     let host = host.trim().trim_end_matches('.');
     if host.is_empty() {
         return Err("空主机名".into());
@@ -233,6 +241,9 @@ pub fn resolve_a_direct(host: &str) -> Result<Vec<String>, String> {
     let mut seen = std::collections::HashSet::new();
 
     for tmpl in DOH_IP_ENDPOINTS {
+        if cancelled() {
+            return Err(crate::speed_select::CANCELLED.into());
+        }
         let url = tmpl.replace("{host}", host);
         let mut cmd = curl_base(iface.as_deref());
         let output = cmd
@@ -263,7 +274,7 @@ pub fn resolve_a_direct(host: &str) -> Result<Vec<String>, String> {
         let body: Value = match serde_json::from_slice(&output.stdout) {
             Ok(v) => v,
             Err(e) => {
-                last_err = format!("DoH JSON: {e}");
+                last_err = format!("DoH JSON: {}", crate::settings::json_error_summary(&e));
                 continue;
             }
         };
@@ -356,7 +367,11 @@ pub fn curl_json_direct(
         "-H",
         "User-Agent: SocksNode/1.0",
         "--resolve",
-        &format!("{host}:{port}:{ip}"),
+        &if crate::ip_probe::is_ipv6_literal(&ip) {
+            format!("{host}:{port}:[{ip}]")
+        } else {
+            format!("{host}:{port}:{ip}")
+        },
     ]);
     // Never put the iLatency session Cookie in curl's command line: ps can
     // reveal -H arguments. Curl supports reading headers from a private file.
@@ -430,7 +445,8 @@ pub fn curl_json_direct(
         return Err("curl 返回空响应".into());
     }
     // Response bodies may contain credentials; do not include them in logs.
-    serde_json::from_str(text.trim()).map_err(|e| format!("JSON 解析失败: {e}"))
+    serde_json::from_str(text.trim())
+        .map_err(|e| format!("JSON 解析失败: {}", crate::settings::json_error_summary(&e)))
 }
 
 /// Result of a SOCKS download sample (body-only throughput).
@@ -620,6 +636,10 @@ fn tcping_once(ip_addr: IpAddr, port: u16, timeout: Duration) -> Option<u64> {
         // LocalAddr bind is the primary anti-utun measure. IP_BOUND_IF is best-effort;
         // some paths are fine with LocalAddr alone.
         let _ = bind_socket_to_iface(&socket, &egress, true);
+    } else {
+        // No IPv6 LocalAddr is known; best-effort IPV6_BOUND_IF keeps the probe
+        // off utun when the physical NIC has IPv6 connectivity.
+        let _ = bind_socket_to_iface(&socket, &egress, false);
     }
 
     let start = std::time::Instant::now();

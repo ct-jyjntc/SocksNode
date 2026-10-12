@@ -3,6 +3,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::collections::HashMap;
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -82,9 +85,12 @@ pub fn pick_free_local_port() -> Result<u16, String> {
 }
 
 /// Wait until TCP connect to 127.0.0.1:port succeeds or timeout.
-fn wait_port_open(port: u16, timeout: Duration) -> bool {
+fn wait_port_open(port: u16, timeout: Duration, cancelled: &dyn Fn() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if cancelled() {
+            return false;
+        }
         if TcpStream::connect_timeout(
             &format!("127.0.0.1:{port}").parse().unwrap(),
             Duration::from_millis(200),
@@ -98,30 +104,145 @@ fn wait_port_open(port: u16, timeout: Duration) -> bool {
     false
 }
 
+/// Registry of temporary speed-test kernels.
+///
+/// Every ephemeral anytls-client is owned by this table from spawn until it is
+/// reaped, so Stop can kill a node's in-flight probe immediately and app
+/// shutdown never leaves an orphan behind. Entries are keyed by a private,
+/// never-reused token (not the pid), so a recycled pid can never make us
+/// kill an unrelated process.
+#[derive(Clone, Default)]
+pub struct TempKernels {
+    inner: Arc<Mutex<TempKernelTable>>,
+}
+
+#[derive(Default)]
+struct TempKernelTable {
+    next_token: u64,
+    /// Set by `kill_all` (shutdown); later registrations are refused.
+    closed: bool,
+    entries: HashMap<u64, (String, Child)>,
+}
+
+impl TempKernels {
+    /// Take ownership of a freshly spawned kernel. After shutdown started the
+    /// child is killed right away and an error is returned.
+    fn register(&self, owner: &str, child: Child) -> Result<u64, String> {
+        let mut table = self.inner.lock();
+        if table.closed {
+            drop(table);
+            let mut child = child;
+            kill_child(&mut child);
+            return Err("应用正在退出，已终止临时 anytls".into());
+        }
+        table.next_token += 1;
+        let token = table.next_token;
+        table.entries.insert(token, (owner.to_string(), child));
+        Ok(token)
+    }
+
+    /// Kill (if still running), wait and forget one temporary kernel.
+    fn reap(&self, token: u64) {
+        let entry = self.inner.lock().entries.remove(&token);
+        if let Some((_, mut child)) = entry {
+            kill_child(&mut child);
+        }
+    }
+
+    /// True while the kernel is registered and has not exited.
+    fn is_running(&self, token: u64) -> bool {
+        let mut table = self.inner.lock();
+        match table.entries.get_mut(&token) {
+            Some((_, child)) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
+    /// Pids of live temporary kernels (never kill these as port squatters).
+    pub fn pids(&self) -> Vec<u32> {
+        self.inner
+            .lock()
+            .entries
+            .values()
+            .map(|(_, c)| c.id())
+            .collect()
+    }
+
+    /// Kill every temporary kernel launched for `owner` (a node id).
+    pub fn kill_owner(&self, owner: &str) {
+        let victims: Vec<Child> = {
+            let mut table = self.inner.lock();
+            let tokens: Vec<u64> = table
+                .entries
+                .iter()
+                .filter(|(_, (o, _))| o == owner)
+                .map(|(t, _)| *t)
+                .collect();
+            tokens
+                .into_iter()
+                .filter_map(|t| table.entries.remove(&t).map(|(_, c)| c))
+                .collect()
+        };
+        for mut child in victims {
+            kill_child(&mut child);
+        }
+    }
+
+    /// Kill and wait for all temporary kernels, and refuse new ones (shutdown).
+    pub fn kill_all(&self) {
+        let victims: Vec<Child> = {
+            let mut table = self.inner.lock();
+            table.closed = true;
+            std::mem::take(&mut table.entries)
+                .into_values()
+                .map(|(_, c)| c)
+                .collect()
+        };
+        for mut child in victims {
+            kill_child(&mut child);
+        }
+    }
+}
+
 fn kill_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
 
+pub const CANCELLED: &str = "已取消（节点已停止或状态已变化）";
+
+/// Connection parameters for one temporary speed-test kernel.
+pub struct ProbeKernel<'a> {
+    pub kernel: &'a Path,
+    pub password: &'a str,
+    pub sni: &'a str,
+    pub skip_cert_verify: bool,
+    /// Same behaviour flags as the node's real kernel (`-dr`, `-udp=false`).
+    pub extra_args: &'a [String],
+    /// Node id that owns the temporary process (for Stop / shutdown cleanup).
+    pub owner: &'a str,
+    pub registry: &'a TempKernels,
+}
+
 /// Start ephemeral anytls-client, download via SOCKS, return Mbps.
-#[allow(clippy::too_many_arguments)]
 pub fn measure_proxy_mbps(
-    kernel: &Path,
+    probe: &ProbeKernel<'_>,
     upstream_host: &str,
     upstream_port: u16,
-    password: &str,
-    sni: &str,
-    skip_cert_verify: bool,
     download_bytes: u64,
     overall_timeout: Duration,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<f64, String> {
+    if cancelled() {
+        return Err(CANCELLED.into());
+    }
     let local_port = pick_free_local_port()?;
     let listen = format!("127.0.0.1:{local_port}");
-    let server = format!("{upstream_host}:{upstream_port}");
-    let sni = if sni.trim().is_empty() {
+    let server = crate::ip_probe::fmt_host_port(upstream_host, upstream_port);
+    let sni = if probe.sni.trim().is_empty() {
         "www.icloud.com"
     } else {
-        sni.trim()
+        probe.sni.trim()
     };
 
     let mut args: Vec<String> = vec![
@@ -132,28 +253,38 @@ pub fn measure_proxy_mbps(
         "-sni".into(),
         sni.to_string(),
     ];
-    if skip_cert_verify {
+    if probe.skip_cert_verify {
         args.push("-insecure".into());
     }
+    args.extend(probe.extra_args.iter().cloned());
     args.extend(crate::net_bind::anytls_bind_args());
-    let mut child = Command::new(kernel)
+    let child = Command::new(probe.kernel)
         .args(&args)
-        .env("SOCKSNODE_PASSWORD", password)
+        .env("SOCKSNODE_PASSWORD", probe.password)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("临时 anytls 启动失败: {e}"))?;
+    let token = probe.registry.register(probe.owner, child)?;
 
-    if !wait_port_open(local_port, Duration::from_secs(3)) {
-        kill_child(&mut child);
+    let ready = wait_port_open(local_port, Duration::from_secs(3), cancelled);
+    if cancelled() {
+        probe.registry.reap(token);
+        return Err(CANCELLED.into());
+    }
+    if !ready || !probe.registry.is_running(token) {
+        probe.registry.reap(token);
         return Err("临时 anytls 未在 3s 内就绪".into());
     }
     // Brief settle so the first SOCKS dial does not race process startup.
     thread::sleep(Duration::from_millis(200));
 
-    let result = measure_via_curl(local_port, download_bytes, overall_timeout);
-    kill_child(&mut child);
+    let result = measure_via_curl(local_port, download_bytes, overall_timeout, cancelled);
+    probe.registry.reap(token);
+    if cancelled() {
+        return Err(CANCELLED.into());
+    }
     result
 }
 
@@ -174,7 +305,12 @@ fn effective_speed_timeout(bytes: u64, user: Duration) -> Duration {
 /// Validated: 156≈50–60 · 177≈50–56 · 103≈1–2 Mbps via real socks5h + physical bind.
 ///
 /// NOTE: curl must use socks5h **without** `--noproxy *` (see net_bind).
-fn measure_via_curl(socks_port: u16, download_bytes: u64, timeout: Duration) -> Result<f64, String> {
+fn measure_via_curl(
+    socks_port: u16,
+    download_bytes: u64,
+    timeout: Duration,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<f64, String> {
     let bytes = download_bytes.clamp(4 * 1024 * 1024, 50 * 1024 * 1024);
     let timeout = effective_speed_timeout(bytes, timeout);
     // LibreSpeed ckSize ≈ MiB of body.
@@ -185,6 +321,9 @@ fn measure_via_curl(socks_port: u16, download_bytes: u64, timeout: Duration) -> 
     let ping_url =
         "https://ams.speedtest.clouvider.net/backend/garbage.php?ckSize=1".to_string();
     for _ in 0..2 {
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         match crate::net_bind::curl_via_socks_download(
             socks_port,
             &ping_url,
@@ -210,6 +349,9 @@ fn measure_via_curl(socks_port: u16, download_bytes: u64, timeout: Duration) -> 
     ];
     let mut errors: Vec<String> = Vec::new();
     for (tag, host) in hosts {
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         let url = format!("https://{host}/backend/garbage.php?ckSize={ck_mb}");
         match crate::net_bind::curl_via_socks_download(
             socks_port,
@@ -240,6 +382,7 @@ pub fn rank_and_pick(
     latency_results: &[ProbeResult],
     top_k: usize,
     speed_test: impl Fn(&str) -> Result<f64, String>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(ScoredIp, Vec<ScoredIp>), String> {
     // Drop impossibly low / near-timeout RTTs.
     let mut reachable: Vec<(String, u64)> = latency_results
@@ -269,6 +412,9 @@ pub fn rank_and_pick(
 
     let mut scored = Vec::new();
     for (ip, rtt) in &shortlist {
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         let (mbps, note) = if matches!(strategy, SelectStrategy::Latency) {
             (None, "latency-only".into())
         } else {
@@ -287,6 +433,9 @@ pub fn rank_and_pick(
         });
     }
 
+    if cancelled() {
+        return Err(CANCELLED.into());
+    }
     let best_rtt = scored.iter().map(|s| s.rtt_ms).min().unwrap_or(1);
     let with_speed: Vec<usize> = scored
         .iter()

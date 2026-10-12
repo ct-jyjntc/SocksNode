@@ -100,20 +100,115 @@ pub struct AppSettingsView {
     pub launch_at_login_active: bool,
 }
 
+/// Result of reading settings.json at startup.
+pub struct SettingsLoad {
+    pub settings: AppSettings,
+    /// User-visible startup warning (corrupt / unreadable file).
+    pub warning: Option<String>,
+    /// The original file could not be read or moved aside: do not overwrite it.
+    pub read_only: bool,
+}
+
+/// Describe a JSON error by position and kind only. serde's Display text can
+/// quote field values (e.g. "invalid type: integer `123`"), which may be a
+/// password or Cookie, so it must never reach logs or the UI.
+pub fn json_error_summary(e: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let kind = match e.classify() {
+        Category::Data => "类型不匹配",
+        Category::Syntax => "语法错误",
+        Category::Eof => "文件不完整",
+        Category::Io => "读取或校验失败",
+    };
+    if e.line() == 0 {
+        kind.to_string()
+    } else {
+        format!("第 {} 行第 {} 列：{kind}", e.line(), e.column())
+    }
+}
+
+/// Parse a config file: strip BOM, require UTF-8, summarise JSON errors.
+pub fn parse_config<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    let raw = std::str::from_utf8(strip_utf8_bom(bytes))
+        .map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?;
+    serde_json::from_str(raw).map_err(|e| json_error_summary(&e))
+}
+
+/// Drop a leading UTF-8 byte order mark (some editors on Windows add one).
+pub fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
+}
+
 impl AppSettings {
     pub fn path(data_dir: &std::path::Path) -> PathBuf {
         data_dir.join("settings.json")
     }
 
-    pub fn load(data_dir: &std::path::Path) -> Self {
+    pub fn load(data_dir: &std::path::Path) -> SettingsLoad {
         let path = Self::path(data_dir);
+        let fresh = |warning: Option<String>, read_only: bool| SettingsLoad {
+            settings: Self::default(),
+            warning,
+            read_only,
+        };
         if !path.exists() {
-            return Self::default();
+            return fresh(None, false);
         }
-        match std::fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-            Err(_) => Self::default(),
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Unreadable (e.g. EACCES) is not corruption: leave the file
+                // alone and never write over it during this run.
+                let msg = format!(
+                    "设置文件无法读取（{e}），本次使用默认设置且不保存修改；请修复 {} 的读取权限后重启",
+                    path.display()
+                );
+                eprintln!("[socks-node] {msg}");
+                return fresh(Some(msg), true);
+            }
+        };
+        let parsed = parse_config::<Self>(&bytes);
+        match parsed {
+            Ok(settings) => SettingsLoad {
+                settings,
+                warning: None,
+                read_only: false,
+            },
+            Err(e) => {
+                // Keep the broken file for inspection instead of silently
+                // overwriting it with defaults on the next save.
+                let ts = chrono::Utc::now().timestamp();
+                let backup = data_dir.join(format!("settings.json.corrupt-{ts}"));
+                let (msg, read_only) = match std::fs::rename(&path, &backup) {
+                    Ok(()) => (
+                        format!(
+                            "设置文件无法解析（{e}），已备份为 {}，已恢复默认设置",
+                            backup.display()
+                        ),
+                        false,
+                    ),
+                    Err(re) => (
+                        format!(
+                            "设置文件无法解析（{e}），备份失败（{re}）；本次使用默认设置且不保存修改；请修复或移走 {} 后重启",
+                            path.display()
+                        ),
+                        true,
+                    ),
+                };
+                eprintln!("[socks-node] {msg}");
+                fresh(Some(msg), read_only)
+            }
         }
+    }
+
+    /// Runtime health-check interval, same range as `update_settings`.
+    pub fn health_interval(&self) -> u64 {
+        self.health_interval_secs.clamp(3, 120)
+    }
+
+    /// Runtime failover cooldown, same range as `update_settings`.
+    pub fn failover_cooldown(&self) -> u64 {
+        self.failover_cooldown_secs.clamp(15, 600)
     }
 
     pub fn save(&self, data_dir: &std::path::Path) -> Result<(), String> {
@@ -140,8 +235,8 @@ impl AppSettings {
         AppSettingsView {
             has_ilatency_cookie: !cookie.is_empty(),
             ilatency_cookie_preview: preview,
-            health_interval_secs: self.health_interval_secs.max(3),
-            failover_cooldown_secs: self.failover_cooldown_secs.max(15),
+            health_interval_secs: self.health_interval(),
+            failover_cooldown_secs: self.failover_cooldown(),
             ilatency_user: username,
             select_strategy: self.select_strategy.as_str().to_string(),
             speed_top_k: self.speed_top_k.clamp(1, 8),

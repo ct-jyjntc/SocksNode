@@ -24,7 +24,25 @@ fn api_json(
 }
 
 /// Collect A-record candidates for a domain via iLatency multi-location DNS.
-pub fn collect_a_records(host: &str, cookie: &str) -> Result<Vec<String>, String> {
+const CANCELLED: &str = crate::speed_select::CANCELLED;
+
+/// Sleep in short slices; false if cancelled meanwhile.
+fn sleep_unless_cancelled(total: Duration, cancelled: &dyn Fn() -> bool) -> bool {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if cancelled() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100).min(deadline - Instant::now()));
+    }
+    !cancelled()
+}
+
+pub fn collect_a_records(
+    host: &str,
+    cookie: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<String>, String> {
     let cookie = cookie.trim();
     if cookie.is_empty() {
         return Err("未配置 iLatency Cookie".into());
@@ -34,6 +52,9 @@ pub fn collect_a_records(host: &str, cookie: &str) -> Result<Vec<String>, String
         return Err("域名为空".into());
     }
 
+    if cancelled() {
+        return Err(CANCELLED.into());
+    }
     let session = api_json("GET", "/api/session", cookie, None, 20)?;
     if session
         .pointer("/user/username")
@@ -62,6 +83,9 @@ pub fn collect_a_records(host: &str, cookie: &str) -> Result<Vec<String>, String
         }
     });
 
+    if cancelled() {
+        return Err(CANCELLED.into());
+    }
     let create_body = api_json("POST", "/api/ping-jobs", cookie, Some(&payload), 35)?;
     let job_id = create_body
         .pointer("/job/id")
@@ -74,7 +98,9 @@ pub fn collect_a_records(host: &str, cookie: &str) -> Result<Vec<String>, String
     let mut final_body = create_body;
 
     while Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(1200));
+        if !sleep_unless_cancelled(Duration::from_millis(1200), cancelled) {
+            return Err(CANCELLED.into());
+        }
         let body = api_json(
             "GET",
             &format!("/api/ping-jobs/{job_id}"),
@@ -82,6 +108,9 @@ pub fn collect_a_records(host: &str, cookie: &str) -> Result<Vec<String>, String
             None,
             25,
         )?;
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         final_body = body;
         last_status = final_body
             .pointer("/job/status")
