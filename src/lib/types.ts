@@ -42,7 +42,7 @@ export type ProxyNode = {
   pid: number | null;
   lastError: string | null;
   lastTest?: NodeTestResult | null;
-  updatedAt?: string;
+  updatedAt?: string | null;
   socks: string;
   lanSocks?: string | null;
   running: boolean;
@@ -68,6 +68,8 @@ export type AppInfo = {
   dataDir: string;
   kernelPath: string;
   version: string;
+  /** Config problems found at startup (corrupt files, disabled duplicates). */
+  startupWarnings: string[];
 };
 
 export type SelectStrategy = "balanced" | "latency" | "throughput";
