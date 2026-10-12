@@ -26,6 +26,9 @@ pub struct AppSettings {
     /// Timeout seconds for each candidate speed test.
     #[serde(default = "default_speed_timeout")]
     pub speed_test_timeout_secs: u64,
+    /// Timeout seconds for each latency probe attempt through a node's SOCKS.
+    #[serde(default = "default_latency_timeout")]
+    pub latency_timeout_secs: u64,
     /// Register app as a login item / autostart entry.
     #[serde(default)]
     pub launch_at_login: bool,
@@ -55,6 +58,9 @@ fn default_speed_timeout() -> u64 {
     // v2rayN default timeout is often 10s; we allow more headroom for slow exits.
     30
 }
+fn default_latency_timeout() -> u64 {
+    8
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -66,6 +72,7 @@ impl Default for AppSettings {
             speed_top_k: default_top_k(),
             speed_test_bytes: default_speed_bytes(),
             speed_test_timeout_secs: default_speed_timeout(),
+            latency_timeout_secs: default_latency_timeout(),
             launch_at_login: false,
             start_minimized: false,
             auto_start_nodes: false,
@@ -85,6 +92,7 @@ pub struct AppSettingsView {
     pub speed_top_k: u32,
     pub speed_test_bytes: u64,
     pub speed_test_timeout_secs: u64,
+    pub latency_timeout_secs: u64,
     pub launch_at_login: bool,
     pub start_minimized: bool,
     pub auto_start_nodes: bool,
@@ -139,6 +147,7 @@ impl AppSettings {
             speed_top_k: self.speed_top_k.clamp(1, 8),
             speed_test_bytes: self.speed_test_bytes.clamp(1024 * 1024, 50 * 1024 * 1024),
             speed_test_timeout_secs: self.speed_test_timeout_secs.clamp(10, 60),
+            latency_timeout_secs: self.latency_timeout_secs.clamp(2, 30),
             launch_at_login: self.launch_at_login,
             start_minimized: self.launch_at_login && self.start_minimized,
             auto_start_nodes: self.auto_start_nodes,
@@ -157,6 +166,7 @@ pub struct AppSettingsPatch {
     pub speed_top_k: Option<u32>,
     pub speed_test_bytes: Option<u64>,
     pub speed_test_timeout_secs: Option<u64>,
+    pub latency_timeout_secs: Option<u64>,
     pub launch_at_login: Option<bool>,
     pub start_minimized: Option<bool>,
     pub auto_start_nodes: Option<bool>,

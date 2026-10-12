@@ -49,6 +49,10 @@ pub struct ProxyNode {
     pub udp: bool,
     pub sni: String,
     pub skip_cert_verify: bool,
+    /// Enable AnyTLS client session reuse. Default off: kernel runs with -dr
+    /// (every connection dials fresh) unless the user opts in.
+    #[serde(default)]
+    pub session_reuse: bool,
     pub local_port: u16,
     pub enabled: bool,
     /// Prefer multi-source DNS + local tcping for domain hosts.
@@ -90,6 +94,8 @@ pub struct NodeInput {
     pub sni: String,
     #[serde(default)]
     pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub session_reuse: bool,
     pub local_port: u16,
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -144,6 +150,8 @@ pub(crate) struct StoredNode {
     sni: String,
     #[serde(rename = "skipCertVerify", alias = "skip_cert_verify")]
     skip_cert_verify: bool,
+    #[serde(rename = "sessionReuse", alias = "session_reuse", default)]
+    session_reuse: bool,
     #[serde(rename = "localPort", alias = "local_port")]
     local_port: u16,
     enabled: bool,
@@ -182,6 +190,7 @@ impl ProxyNode {
             udp: self.udp,
             sni: self.sni.clone(),
             skip_cert_verify: self.skip_cert_verify,
+            session_reuse: self.session_reuse,
             local_port: self.local_port,
             enabled: self.enabled,
             prefer_fastest_ip: self.prefer_fastest_ip,
@@ -202,6 +211,7 @@ impl ProxyNode {
             udp: s.udp,
             sni: s.sni,
             skip_cert_verify: s.skip_cert_verify,
+            session_reuse: s.session_reuse,
             local_port: s.local_port,
             enabled: s.enabled,
             prefer_fastest_ip: s.prefer_fastest_ip,
@@ -271,13 +281,70 @@ pub fn store_to_json(nodes: &[ProxyNode]) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&store)
 }
 
+/// Ids written before the UUID hardening (e.g. "hk-01") are safe directory
+/// names but fail strict UUID parsing. Derive a stable UUID for them so old
+/// configs keep loading; ids outside `[A-Za-z0-9_-]` stay rejected.
+pub fn migrate_legacy_id(id: &str) -> Option<String> {
+    let safe = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !safe || uuid::Uuid::parse_str(id).is_ok() {
+        return None;
+    }
+    // Deterministic RFC 4122-layout UUID via FNV-1a over a namespaced input,
+    // so every launch and the instance-dir rename agree on the same new id.
+    fn fnv1a(seed: u64, data: &[u8]) -> u64 {
+        let mut h = seed;
+        for &b in data {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    let input = format!("socksnode-legacy-id-v1:{id}");
+    let hi = fnv1a(OFFSET, input.as_bytes());
+    let lo = fnv1a(OFFSET ^ 0x9e37_79b9_7f4a_7c15, input.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&lo.to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant RFC 4122
+    Some(uuid::Uuid::from_bytes(bytes).to_string())
+}
+
+/// (old_id, new_id) pairs in a stored config that need legacy id migration.
+pub fn legacy_id_map(raw: &str) -> Vec<(String, String)> {
+    let Ok(store) = serde_json::from_str::<StoreFile>(raw) else {
+        return Vec::new();
+    };
+    store
+        .nodes
+        .iter()
+        .filter_map(|n| migrate_legacy_id(&n.id).map(|new| (n.id.clone(), new)))
+        .collect()
+}
+
 pub fn store_from_json(raw: &str) -> Result<Vec<ProxyNode>, serde_json::Error> {
-    let store: StoreFile = serde_json::from_str(raw)?;
+    let mut store: StoreFile = serde_json::from_str(raw)?;
     let mut seen = std::collections::HashSet::new();
-    for node in &store.nodes {
+    for node in &mut store.nodes {
         // Node ids are used as directory names and receive untrusted IPC input.
         // Reject path traversal, invalid ids, and duplicates in hand-edited files.
-        if uuid::Uuid::parse_str(&node.id).is_err() || !seen.insert(&node.id) {
+        if uuid::Uuid::parse_str(&node.id).is_err() {
+            match migrate_legacy_id(&node.id) {
+                Some(new_id) => node.id = new_id,
+                None => {
+                    return Err(serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "节点配置包含非法或重复 ID",
+                    )))
+                }
+            }
+        }
+        if !seen.insert(node.id.clone()) {
             return Err(serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "节点配置包含非法或重复 ID",

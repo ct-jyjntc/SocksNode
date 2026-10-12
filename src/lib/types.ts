@@ -31,6 +31,7 @@ export type ProxyNode = {
   udp: boolean;
   sni: string;
   skipCertVerify: boolean;
+  sessionReuse: boolean;
   localPort: number;
   enabled: boolean;
   preferFastestIp: boolean;
@@ -56,6 +57,7 @@ export type NodeInput = {
   udp?: boolean;
   sni?: string;
   skipCertVerify?: boolean;
+  sessionReuse?: boolean;
   localPort: number;
   enabled?: boolean;
   preferFastestIp?: boolean;
@@ -80,6 +82,7 @@ export type AppSettingsView = {
   speedTopK: number;
   speedTestBytes: number;
   speedTestTimeoutSecs: number;
+  latencyTimeoutSecs: number;
   launchAtLogin: boolean;
   startMinimized: boolean;
   autoStartNodes: boolean;
@@ -94,6 +97,7 @@ export type AppSettingsPatch = {
   speedTopK?: number;
   speedTestBytes?: number;
   speedTestTimeoutSecs?: number;
+  latencyTimeoutSecs?: number;
   launchAtLogin?: boolean;
   startMinimized?: boolean;
   autoStartNodes?: boolean;

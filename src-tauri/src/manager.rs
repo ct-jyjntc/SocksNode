@@ -4,7 +4,7 @@ use crate::ip_probe::{
 };
 use crate::net_bind;
 use crate::models::{
-    default_nodes, now_iso, store_from_json, store_to_json, AppInfo, LogEntry, LogEvent, NodeInput,
+    default_nodes, now_iso, legacy_id_map, store_from_json, store_to_json, AppInfo, LogEntry, LogEvent, NodeInput,
     NodeStatus, NodeTestResult, ProbeStatus, ProxyNode,
 };
 use crate::settings::{AppSettings, AppSettingsPatch, AppSettingsView};
@@ -225,6 +225,9 @@ impl Manager {
             if let Some(v) = patch.speed_test_timeout_secs {
                 pending.speed_test_timeout_secs = v.clamp(10, 60);
             }
+            if let Some(v) = patch.latency_timeout_secs {
+                pending.latency_timeout_secs = v.clamp(2, 30);
+            }
             if let Some(v) = patch.launch_at_login {
                 pending.launch_at_login = v;
             }
@@ -274,7 +277,21 @@ impl Manager {
         std::fs::create_dir_all(&self.instances_dir).map_err(|e| e.to_string())?;
         let mut nodes = if self.store_path.exists() {
             let raw = std::fs::read_to_string(&self.store_path).map_err(|e| e.to_string())?;
-            store_from_json(&raw).map_err(|e| e.to_string())?
+            // Upgrade pre-UUID-hardening node ids; carry each node's instance
+            // dir (config, cache, logs) over to the migrated id.
+            let migrations = legacy_id_map(&raw);
+            for (old, new) in &migrations {
+                let from = self.instances_dir.join(old);
+                let to = self.instances_dir.join(new);
+                if from.exists() && !to.exists() {
+                    let _ = std::fs::rename(&from, &to);
+                }
+            }
+            let nodes = store_from_json(&raw).map_err(|e| e.to_string())?;
+            if !migrations.is_empty() {
+                self.persist_nodes(&nodes)?;
+            }
+            nodes
         } else {
             let defaults = default_nodes();
             self.persist_nodes(&defaults)?;
@@ -570,6 +587,7 @@ impl Manager {
                 }
             },
             skip_cert_verify: input.skip_cert_verify,
+            session_reuse: input.session_reuse,
             local_port: input.local_port,
             enabled: input.enabled,
             prefer_fastest_ip: input.prefer_fastest_ip,
@@ -589,6 +607,7 @@ impl Manager {
             udp: data.udp,
             sni: data.sni,
             skip_cert_verify: data.skip_cert_verify,
+            session_reuse: data.session_reuse,
             local_port: data.local_port,
             enabled: data.enabled,
             prefer_fastest_ip: data.prefer_fastest_ip,
@@ -653,6 +672,7 @@ impl Manager {
             node.udp = data.udp;
             node.sni = data.sni;
             node.skip_cert_verify = data.skip_cert_verify;
+            node.session_reuse = data.session_reuse;
             node.local_port = data.local_port;
             node.enabled = data.enabled;
             node.prefer_fastest_ip = data.prefer_fastest_ip;
@@ -898,6 +918,9 @@ impl Manager {
         ];
         if node_snapshot.skip_cert_verify {
             args.push("-insecure".into());
+        }
+        if !node_snapshot.session_reuse {
+            args.push("-dr".into());
         }
         if !node_snapshot.udp {
             args.push("-udp=false".into());
@@ -1271,6 +1294,10 @@ impl Manager {
 
         self.append_log(id, "simple latency via socks…");
         let socks = format!("127.0.0.1:{local_port}");
+        let timeout = self.settings.lock().latency_timeout_secs.clamp(2, 30);
+        let connect_timeout = timeout.min(5);
+        let timeout_s = timeout.to_string();
+        let connect_timeout_s = connect_timeout.to_string();
         // Lightweight endpoints — measure total time of a tiny HTTP response.
         let urls = [
             "http://www.gstatic.com/generate_204",
@@ -1288,9 +1315,9 @@ impl Manager {
                     "-o",
                     "/dev/null",
                     "-m",
-                    "8",
+                    &timeout_s,
                     "--connect-timeout",
-                    "5",
+                    &connect_timeout_s,
                     "--socks5-hostname",
                     &socks,
                     "-w",
@@ -2270,6 +2297,9 @@ impl Manager {
         if node_snapshot.skip_cert_verify {
             args.push("-insecure".into());
         }
+        if !node_snapshot.session_reuse {
+            args.push("-dr".into());
+        }
         if !node_snapshot.udp {
             args.push("-udp=false".into());
         }
@@ -2584,6 +2614,7 @@ mod tests {
                 udp: true,
                 sni: "example.com".into(),
                 skip_cert_verify: false,
+                session_reuse: false,
                 local_port: 58983,
                 enabled,
                 prefer_fastest_ip: false,
@@ -2742,6 +2773,7 @@ mod tests {
                     udp: patch.udp,
                     sni: patch.sni,
                     skip_cert_verify: patch.skip_cert_verify,
+                    session_reuse: patch.session_reuse,
                     local_port: patch.local_port,
                     enabled: patch.enabled,
                     prefer_fastest_ip: patch.prefer_fastest_ip,

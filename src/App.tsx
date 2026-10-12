@@ -13,7 +13,7 @@ type LogFilter = "all" | "ok" | "warn";
 const NAV: [Page, string][] = [["nodes", "节点"], ["upstreams", "上游"], ["gateway", "网关"], ["routing", "优选"], ["latency", "延迟"], ["logs", "日志"]];
 const STRATEGIES: [SelectStrategy, string][] = [["throughput", "高带宽"], ["balanced", "均衡"], ["latency", "低延迟"]];
 const SNI_PRESETS = ["www.icloud.com", "gateway.icloud.com", "www.microsoft.com", "www.apple.com", "dl.google.com"];
-const BASE_FORM: NodeInput = { name: "", type: "anytls", server: "", port: 443, password: "", sni: "www.icloud.com", localPort: 5001, enabled: true, udp: true, preferFastestIp: true, skipCertVerify: true, lanAccess: false };
+const BASE_FORM: NodeInput = { name: "", type: "anytls", server: "", port: 443, password: "", sni: "www.icloud.com", localPort: 5001, enabled: true, udp: true, preferFastestIp: true, skipCertVerify: true, lanAccess: false, sessionReuse: false };
 const cn = (...values: (string | false | null | undefined)[]) => values.filter(Boolean).join(" ");
 const flag = (name: string) => /香港|hk\b/i.test(name) ? "🇭🇰" : /日本|东京|大阪|jp\b/i.test(name) ? "🇯🇵" : /新加坡|sg\b/i.test(name) ? "🇸🇬" : /美国|洛杉矶|us\b/i.test(name) ? "🇺🇸" : /德国|法兰克福|de\b/i.test(name) ? "🇩🇪" : /台湾|tw\b/i.test(name) ? "🇹🇼" : /韩国|首尔|kr\b/i.test(name) ? "🇰🇷" : "🌐";
 const dotClass = (status: ProxyNode["status"]) => status === "running" ? "on" : status === "error" ? "err" : status === "starting" || status === "stopping" ? "busy" : "";
@@ -22,7 +22,7 @@ const runtimeLatency = (node: ProxyNode) => node.lastTest?.ok ? node.lastTest.ms
 const fmtTime = (value: string) => { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString("zh-CN", { hour12: false }); };
 const errMessage = (error: unknown) => error instanceof Error ? error.message : String(error || "操作失败");
 function nextPort(nodes: ProxyNode[]) { const used = new Set(nodes.map(n => n.localPort)); let p = 5001; while (used.has(p) && p < 65535) p++; return p; }
-function toInput(node: ProxyNode): NodeInput { return { name: node.name, type: "anytls", server: node.server, port: node.port, password: node.password, sni: node.sni, localPort: node.localPort, enabled: node.enabled, udp: node.udp, preferFastestIp: node.preferFastestIp, skipCertVerify: node.skipCertVerify, lanAccess: node.lanAccess }; }
+function toInput(node: ProxyNode): NodeInput { return { name: node.name, type: "anytls", server: node.server, port: node.port, password: node.password, sni: node.sni, localPort: node.localPort, enabled: node.enabled, udp: node.udp, preferFastestIp: node.preferFastestIp, skipCertVerify: node.skipCertVerify, lanAccess: node.lanAccess, sessionReuse: node.sessionReuse }; }
 function anytlsLink(node: ProxyNode) {
   const url = new URL("anytls://placeholder");
   url.hostname = node.server.includes(":") && !node.server.startsWith("[") ? "[" + node.server + "]" : node.server;
@@ -254,11 +254,11 @@ function App() {
   const allAction = (action: "start" | "stop" | "test") => {
     if (action === "start") void perform("正在批量启动…", () => api.startAll(), "批量启动完成");
     if (action === "stop") void perform("正在批量停止…", () => api.stopAll(), "全部停止");
-    if (action === "test") void perform("正在逐个测延迟…", async () => {
+    if (action === "test") void perform("正在并发测延迟…", async () => {
       const candidates = nodes.filter(n => n.status === "running");
       if (!candidates.length) throw new Error("目前没有运行中的节点");
-      let success = 0;
-      for (const node of candidates) { try { const result = await api.test(node.id); if (result.ok) success++; } catch { /* continue */ } }
+      const results = await Promise.allSettled(candidates.map(node => api.test(node.id)));
+      const success = results.filter(r => r.status === "fulfilled" && r.value.ok).length;
       toast("延迟测试：" + success + "/" + candidates.length + " 成功", success === candidates.length ? "ok" : "warn");
     });
   };
@@ -310,9 +310,10 @@ function App() {
       <Field label="密码"><input className="inp mono" type="password" autoComplete="off" value={form.password} onChange={e => onField("password", e.target.value)}/></Field>
       <Field label="SNI"><input className="inp mono" value={form.sni ?? ""} onChange={e => onField("sni", e.target.value)}/></Field>
       <Field label="本机端口"><div><input className="inp mono" style={{ width: 115 }} type="number" min="1" max="65535" value={form.localPort} onChange={e => onField("localPort", Number(e.target.value))}/><div className="hint">127.0.0.1 监听；局域网连入时为 0.0.0.0</div></div></Field>
-      <Field label="选项"><div><div className="checks">{check("udp", "UDP over TCP")}{check("preferFastestIp", "启动时优选 IP")}{check("skipCertVerify", "跳过证书验证")}{check("enabled", "参与全部启动")}{check("lanAccess", "局域网连入")}</div>
+      <Field label="选项"><div><div className="checks">{check("udp", "UDP over TCP")}{check("preferFastestIp", "启动时优选 IP")}{check("skipCertVerify", "跳过证书验证")}{check("enabled", "参与全部启动")}{check("lanAccess", "局域网连入")}{check("sessionReuse", "连接复用")}</div>
         {form.lanAccess && <div className="hint warn">局域网代理没有认证，同一网络中的其他设备可能使用它。</div>}
         {form.skipCertVerify && <div className="hint warn">已关闭上游 TLS 证书验证，请仅在可信任的节点上使用。</div>}
+        {form.sessionReuse && <div className="hint">已开启 AnyTLS 会话复用：多条请求共享同一条 TLS 会话，握手开销更低；若上游出现兼容性异常请关闭。</div>}
       </div></Field>
       <div className="efoot">
         {!isNew && <><TextBtn kind="danger" disabled={inProgress} onClick={() => setConfirmDelete(editorId)}>删除节点</TextBtn>
@@ -469,6 +470,7 @@ function App() {
           <PrefRow title="测速候选数" description="TCPing 最快的前 K 个参与测速，范围 1–8" control={number(s.speedTopK, "个", 1, 8, v => void applySettings({ speedTopK: v }))}/>
           <PrefRow title="测速下载量" description="每个候选的下载量，1–50 MB" control={number(Math.round(s.speedTestBytes / 1048576), "MB", 1, 50, v => void applySettings({ speedTestBytes: v * 1048576 }))}/>
           <PrefRow title="测速超时" description="单个测速请求允许的最长时间" control={number(s.speedTestTimeoutSecs, "秒", 3, 60, v => void applySettings({ speedTestTimeoutSecs: v }))}/>
+          <PrefRow title="延迟测试超时" description="单次延迟探测允许的最长时间，2–30 秒" control={number(s.latencyTimeoutSecs, "秒", 2, 30, v => void applySettings({ latencyTimeoutSecs: v }))}/>
           <PrefRow title="探活间隔" description="运行中上游健康检查的间隔，3–120 秒" control={number(s.healthIntervalSecs, "秒", 3, 120, v => void applySettings({ healthIntervalSecs: v }))}/>
           <PrefRow title="切换冷却" description="上游故障重新优选后，最短冷却间隔，15–600 秒" control={number(s.failoverCooldownSecs, "秒", 15, 600, v => void applySettings({ failoverCooldownSecs: v }))}/>
         </>}
